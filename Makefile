@@ -35,3 +35,7 @@ seed:
 
 clean-db:
 	rm -f var/app.db var/app.db-shm var/app.db-wal
+
+.PHONY: state-clean
+state-clean:
+	$(PY) python scripts/cleanup_state.py

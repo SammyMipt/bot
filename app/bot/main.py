@@ -18,6 +18,10 @@ async def main():
     bot = Bot(cfg.telegram_token)
     dp = Dispatcher()
     dp.message.register(on_start, CommandStart())
+    # EPIC-2 demo router
+    from app.bot.demo_epic2 import router as demo_router
+
+    dp.include_router(demo_router)
     await dp.start_polling(bot)
 
 

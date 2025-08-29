@@ -25,3 +25,11 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.flake8]
 max-line-length = 120
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+line_length = 88
+known_first_party = ["app"]
