@@ -26,4 +26,7 @@ df -h . | tail -n +2
 echo "[doctor] checking pre-commit"
 poetry run pre-commit --version || echo "pre-commit is not available (will be installed by poetry)"
 
+echo "[doctor] sqlite3 version"
+sqlite3 --version || echo "sqlite3 not found (optional for manual inspection)"
+
 echo "[doctor] done"

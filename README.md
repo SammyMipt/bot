@@ -16,3 +16,11 @@ make run-bot
 - `make lint` — линтеры
 - `make test` — тесты
 - `make run-bot` — запустить бота
+
+## Миграции и начальные данные
+
+```bash
+make migrate
+make seed
+sqlite3 var/app.db ".tables"
+sqlite3 var/app.db "SELECT id, role, tg_id FROM users;"
