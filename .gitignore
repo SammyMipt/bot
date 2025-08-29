@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+.venv/
+.idea/
+.mypy_cache/
+dist/
+build/
+var/*
+!var/.gitkeep
+.env
+poetry.lock
