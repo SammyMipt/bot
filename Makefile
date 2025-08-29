@@ -1,29 +1,37 @@
-    .PHONY: init dev run-bot lint fmt test doctor dirs
+.PHONY: init dev run-bot lint fmt test doctor dirs migrate seed clean-db
 
-    PY=poetry run
+PY=poetry run
+DEV_DIRS=var var/materials var/submissions var/exports var/tmp var/logs
 
-    DEV_DIRS=var var/materials var/submissions var/exports var/tmp var/logs
-
-    init: dirs
+init: dirs
 	poetry install
 
-    dev: init
+dev: init
 	@echo "Dev env ready"
 
-    run-bot:
+run-bot:
 	$(PY) python -m app.bot.main
 
-    lint:
+lint:
 	poetry run flake8 app
 
-    fmt:
+fmt:
 	poetry run black app tests && poetry run isort app tests
 
-    test:
+test:
 	$(PY) pytest -q
 
-    doctor:
+doctor:
 	bash scripts/doctor.sh
 
-    dirs:
+dirs:
 	@mkdir -p $(DEV_DIRS)
+
+migrate:
+	$(PY) python scripts/migrate.py
+
+seed:
+	SEED_OWNER_TG_ID=dev_owner $(PY) python scripts/seed.py
+
+clean-db:
+	rm -f var/app.db var/app.db-shm var/app.db-wal
