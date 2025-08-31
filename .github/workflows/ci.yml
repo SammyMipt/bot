@@ -36,6 +36,11 @@ jobs:
           poetry run black --check .
           poetry run flake8
 
+      - name: Prepare DB (migrations)
+        run: |
+          mkdir -p var
+          poetry run python scripts/migrate.py
+
       - name: Test
         run: poetry run pytest -q
 
