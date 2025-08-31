@@ -39,3 +39,11 @@ clean-db:
 .PHONY: state-clean
 state-clean:
 	$(PY) python scripts/cleanup_state.py
+
+.PHONY: ci
+ci: fmt lint test
+
+.PHONY: test-cov
+test-cov:
+	poetry run pytest -q --maxfail=1 --disable-warnings \
+		--cov=app --cov=scripts --cov-report=term-missing:skip-covered

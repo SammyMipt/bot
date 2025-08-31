@@ -1,0 +1,10 @@
+[run]
+omit =
+    app/bot/main.py
+    app/bot/demo_epic2.py
+    app/core/logging.py
+    scripts/*
+
+[report]
+skip_covered = True
+show_missing = True
