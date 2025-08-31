@@ -28,7 +28,7 @@ jobs:
         run: pipx install poetry
 
       - name: Install deps
-        run: poetry install --no-interaction --no-root
+        run: poetry install --no-interaction
 
       - name: Lint
         run: |
