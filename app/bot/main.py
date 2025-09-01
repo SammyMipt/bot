@@ -7,6 +7,7 @@ from aiogram.types import Message
 
 from app.bot.commands_epic4_owner import router as epic4_owner_router
 from app.bot.commands_epic4_student import router as epic4_student_router
+from app.bot.commands_epic4_teacher import router as epic4_teacher_router
 from app.bot.demo_epic2 import router as demo_router
 from app.core.config import cfg
 from app.core.logging import setup_logging
@@ -38,8 +39,9 @@ async def main():
     from app.bot.commands_epic3 import router as epic3_router
 
     dp.include_router(epic3_router)
-    # 🔽 EPIC-4: order matters — owner first, then student
+    # 🔽 EPIC-4: order matters — owner/teacher first, then student
     dp.include_router(epic4_owner_router)
+    dp.include_router(epic4_teacher_router)
     dp.include_router(epic4_student_router)
 
     await dp.start_polling(bot)

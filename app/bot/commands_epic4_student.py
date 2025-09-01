@@ -339,12 +339,4 @@ async def my_submissions(m: types.Message, actor: Identity):
     await m.answer("\n".join(lines))
 
 
-@router.message(Command("cancel"))
-async def universal_cancel(m: types.Message):
-    uid = _uid(m)
-    for key in (f"amw:{uid}", f"wk_submit:{uid}"):
-        try:
-            state_store.delete(key)
-        except Exception:
-            pass
-    await m.answer("Ок, отменил.")
+# /cancel — общий хендлер реализован в owner/teacher части для единообразия

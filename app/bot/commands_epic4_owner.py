@@ -239,4 +239,4 @@ async def owner_cancel_cmd(m: types.Message):
         state_store.delete(f"wk_submit:{uid}")
     except Exception:
         pass
-    await m.answer("Ок, отменил.")
+    await m.answer("Ок, отменил. Активные сценарии сброшены.")
