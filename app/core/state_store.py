@@ -45,6 +45,30 @@ def put(value: Any, role: Optional[str] = None, ttl_sec: int = DEFAULT_TTL_SEC) 
     return k
 
 
+def put_at(
+    key: str, value: Any, role: Optional[str] = None, ttl_sec: int = DEFAULT_TTL_SEC
+) -> None:
+    """Store value under a provided key (overwrites if exists)."""
+    _ensure_table()
+    created = now()
+    expires = created + max(1, ttl_sec)
+    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO state_store(key, role, value_json, created_at_utc, expires_at_utc)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+              role=excluded.role,
+              value_json=excluded.value_json,
+              created_at_utc=excluded.created_at_utc,
+              expires_at_utc=excluded.expires_at_utc
+            """,
+            (key, role, payload, created, expires),
+        )
+        conn.commit()
+
+
 def get(key: str, expected_role: Optional[str] = None) -> Any:
     _ensure_table()
     with db() as conn:

@@ -42,14 +42,6 @@ def save_blob(
     if not existed:
         with open(blob_path, "wb") as f:
             f.write(data)
-    if suggested_name:
-        safe = safe_filename(suggested_name)
-        hint = os.path.join(base, f"{digest}__{safe}")
-        if not os.path.exists(hint):
-            try:
-                with open(hint, "wb") as f:
-                    f.write(b"")
-            except Exception:
-                pass
+    # Do not create extra placeholder files; store exactly one content file.
     size_bytes = os.path.getsize(blob_path)
     return SavedBlob(digest, blob_path, size_bytes, existed)
