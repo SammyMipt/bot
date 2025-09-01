@@ -134,16 +134,9 @@ def add_submission_file(
                 (submission_id, sha256, size_bytes, path, mime),
             )
             return cur.lastrowid
-        except Exception:
-            # Может сработать UNIQUE (submission_id, sha256, size_bytes) WHERE deleted_at_utc IS NULL
-            row = conn.execute(
-                """
-                SELECT id FROM week_submission_files
-                WHERE submission_id=? AND sha256=? AND size_bytes=? AND deleted_at_utc IS NULL
-                """,
-                (submission_id, sha256, size_bytes),
-            ).fetchone()
-            return int(row[0]) if row else -1
+        except sqlite3.IntegrityError:
+            # Дубликат (UNIQUE по submission_id + sha256 + size_bytes для не удалённых)
+            return -1
 
 
 def list_submission_files(student_id: int, week_no: int) -> List[Dict]:
@@ -224,3 +217,66 @@ def list_weeks(limit: int = 50) -> List[int]:
             (limit,),
         ).fetchall()
     return [int(r[0]) for r in rows]
+
+
+# ---------- TEACHER VIEW (read-only) ----------
+
+
+def list_students_with_submissions_by_week(week_no: int) -> List[Dict]:
+    """
+    Возвращает список студентов, у которых есть активные (не удалённые) файлы в сдачах за неделю.
+    Формат элементов: { student_id, tg_id, name, files_count }
+    Порядок детерминированный: по LOWER(name), затем по u.id.
+    """
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.student_id,
+                   u.tg_id,
+                   u.name,
+                   COUNT(f.id) AS files_count
+            FROM submissions s
+            JOIN users u ON u.id = s.student_id
+            JOIN week_submission_files f
+                 ON f.submission_id = s.id AND f.deleted_at_utc IS NULL
+            WHERE s.week_no = ?
+            GROUP BY s.student_id, u.tg_id, u.name
+            ORDER BY LOWER(COALESCE(u.name, '')) ASC, u.id ASC
+            """,
+            (week_no,),
+        ).fetchall()
+    return [
+        {
+            "student_id": int(r[0]),
+            "tg_id": r[1],
+            "name": r[2],
+            "files_count": int(r[3]),
+        }
+        for r in rows
+    ]
+
+
+def list_week_submission_files_for_teacher(student_id: int, week_no: int) -> List[Dict]:
+    """Файлы сдачи студента за неделю (только не удалённые)."""
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT f.id, f.sha256, f.size_bytes, f.path, f.mime, f.created_at_utc
+            FROM submissions s
+            JOIN week_submission_files f ON f.submission_id = s.id
+            WHERE s.student_id=? AND s.week_no=? AND f.deleted_at_utc IS NULL
+            ORDER BY f.id ASC
+            """,
+            (student_id, week_no),
+        ).fetchall()
+    return [
+        {
+            "id": int(r[0]),
+            "sha256": r[1],
+            "size_bytes": int(r[2]),
+            "path": r[3],
+            "mime": r[4],
+            "created_at_utc": int(r[5]) if r[5] is not None else None,
+        }
+        for r in rows
+    ]
