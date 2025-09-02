@@ -87,14 +87,14 @@ def _parse_csv(
 
 def _find_user_by_email_or_name(
     conn, role: str, email: Optional[str], name: str
-) -> Optional[int]:
+) -> str | int | None:
     if email:
         r = conn.execute(
             "SELECT id FROM users WHERE role=? AND email=? LIMIT 1",
             (role, email),
         ).fetchone()
         if r:
-            return int(r[0])
+            return r[0]
     # fallback by name (email absent or not found)
     r = conn.execute(
         "SELECT id FROM users WHERE role=? AND LOWER(COALESCE(name,''))=LOWER(?) ORDER BY id ASC LIMIT 2",
@@ -105,7 +105,7 @@ def _find_user_by_email_or_name(
     if len(r) > 1:
         # ambiguous — treat as duplicate
         return -1
-    return int(r[0][0])
+    return r[0][0]
 
 
 def import_teachers_csv(content: bytes) -> ImportResult:

@@ -9,7 +9,7 @@ from app.db.conn import db
 
 @dataclass
 class Identity:
-    id: int
+    id: str
     role: str
     tg_id: str
     name: Optional[str]

@@ -43,7 +43,7 @@ def _ensure_assignment_for_week(conn, week_no: int) -> int:
     ).fetchone()[0]
 
 
-def _ensure_user(conn) -> int:
+def _ensure_user(conn) -> str:
     # materials.uploaded_by -> users.id (FK). Создадим простого пользователя.
     # В твоей users-схеме есть tg_id UNIQUE, role, name, created_at_utc и т.п. Подстроимся минимально.
     # Если created_at_utc обязателен — используем strftime.
@@ -64,7 +64,7 @@ def _ensure_user(conn) -> int:
             "INSERT INTO users(tg_id, role) VALUES(?, 'student')",
             (tg,),
         )
-    return conn.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1").fetchone()[0]
+    return conn.execute("SELECT id FROM users WHERE tg_id=?", (tg,)).fetchone()[0]
 
 
 @pytest.mark.parametrize("week", [1])

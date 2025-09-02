@@ -29,6 +29,9 @@ class AuthMiddleware(BaseMiddleware):
                 from app.core.auth import Identity
 
                 data["actor"] = Identity(
-                    id=-1, role="guest", tg_id=eff_tg_id, name=tg_user.full_name or None
+                    id="guest",
+                    role="guest",
+                    tg_id=eff_tg_id,
+                    name=tg_user.full_name or None,
                 )
         return await handler(event, data)

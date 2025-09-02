@@ -7,9 +7,9 @@ from app.db.conn import db
 
 def log(
     event: str,
-    actor_id: Optional[int],
+    actor_id: Optional[str],
     *,
-    as_user_id: Optional[int] = None,
+    as_user_id: Optional[str] = None,
     as_role: Optional[str] = None,
     object_type: Optional[str] = None,
     object_id: Optional[int] = None,

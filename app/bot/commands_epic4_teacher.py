@@ -154,13 +154,13 @@ async def tview_pick_week(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(F.data.regexp(r"^tview:open:(\d+):(\d+)$"))
+@router.callback_query(F.data.regexp(r"^tview:open:(\d+):([\w-]+)$"))
 async def tview_open_student(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
     parts = cq.data.split(":")
     week_no = int(parts[2])
-    student_id = int(parts[3])
+    student_id = parts[3]
     files = list_week_submission_files_for_teacher(student_id, week_no)
     if not files:
         await cq.message.answer(

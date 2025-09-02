@@ -13,7 +13,7 @@ def is_tg_bound(tg_id: str) -> bool:
         return r is not None
 
 
-def bind_tg(user_id: int, tg_id: str) -> bool:
+def bind_tg(user_id: str, tg_id: str) -> bool:
     """Bind tg_id to user if user is active and not bound; returns True if success."""
     with db() as conn:
         used = conn.execute("SELECT 1 FROM users WHERE tg_id=?", (tg_id,)).fetchone()
@@ -41,7 +41,7 @@ def find_students_by_email(email: str) -> List[Dict]:
         ).fetchall()
     return [
         {
-            "id": int(r[0]),
+            "id": r[0],
             "role": r[1],
             "name": r[2],
             "email": r[3],
@@ -61,7 +61,7 @@ def find_free_teachers_for_bind() -> List[Dict]:
         ).fetchall()
     return [
         {
-            "id": int(r[0]),
+            "id": r[0],
             "role": r[1],
             "name": r[2],
             "email": r[3],

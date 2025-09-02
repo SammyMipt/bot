@@ -309,7 +309,7 @@ async def reg_back(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-def _load_labels(ids: list[int]) -> dict[int, str]:
+def _load_labels(ids: list[str]) -> dict[str, str]:
     if not ids:
         return {}
     placeholders = ",".join(["?"] * len(ids))
@@ -318,9 +318,9 @@ def _load_labels(ids: list[int]) -> dict[int, str]:
             f"SELECT id, name, group_name, role FROM users WHERE id IN ({placeholders})",
             tuple(ids),
         ).fetchall()
-    labels: dict[int, str] = {}
+    labels: dict[str, str] = {}
     for r in rows:
-        uid, name, group_name, role = int(r[0]), r[1], r[2], r[3]
+        uid, name, group_name, role = r[0], r[1], r[2], r[3]
         base = name or f"ID {uid}"
         if role == "student" and group_name:
             base = f"{base} · {group_name}"
@@ -329,7 +329,7 @@ def _load_labels(ids: list[int]) -> dict[int, str]:
 
 
 def _list_keyboard(
-    role: str, page: int, total_pages: int, ids: list[int]
+    role: str, page: int, total_pages: int, ids: list[str]
 ) -> types.InlineKeyboardMarkup:
     per_page = 10
     start = page * per_page
@@ -360,7 +360,7 @@ def _list_keyboard(
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _send_candidates_list(m: types.Message, role: str, page: int, ids: list[int]):
+async def _send_candidates_list(m: types.Message, role: str, page: int, ids: list[str]):
     per_page = 10
     total_pages = max(1, (len(ids) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
@@ -396,12 +396,12 @@ async def reg_page(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(F.data.regexp(r"^reg:pick:(\d+)$"))
+@router.callback_query(F.data.regexp(r"^reg:pick:([\w-]+)$"))
 async def reg_pick(cq: types.CallbackQuery, actor: Identity):
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     role = st.get("role") or "s"
-    user_id = int(cq.data.split(":")[2])
+    user_id = cq.data.split(":")[2]
     state_store.put_at(
         _reg_key(uid),
         {"role": role, "step": "confirm", "user_id": user_id},
@@ -437,7 +437,7 @@ async def reg_confirm(cq: types.CallbackQuery, actor: Identity):
         await cq.message.answer("Этот аккаунт уже привязан. Открываю главное меню.")
         await cq.answer()
         return
-    ok = repo_users.bind_tg(int(user_id), eff)
+    ok = repo_users.bind_tg(user_id, eff)
     if not ok:
         await cq.message.answer(
             "E_ALREADY_BOUND — Запись уже привязана. Попробуйте начать заново."

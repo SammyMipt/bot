@@ -18,7 +18,7 @@ class Material:
     sha256: str
     size_bytes: int
     mime: Optional[str]
-    uploaded_by: int
+    uploaded_by: str
     created_at_utc: int
     week_no: Optional[int] = None
     visibility: Optional[str] = None
@@ -65,7 +65,7 @@ def list_materials_by_week(week_no: int, audience: str = "student") -> List[Mate
 
 def insert_week_material_file(
     week_no: int,
-    uploaded_by: int,
+    uploaded_by: str,
     path: str,
     sha256: str,
     size_bytes: int,
@@ -94,7 +94,7 @@ def insert_week_material_file(
 # ---------- WEEK SUBMISSIONS (недельные, многофайловые) ----------
 
 
-def get_or_create_week_submission(student_id: int, week_no: int) -> int:
+def get_or_create_week_submission(student_id: str, week_no: int) -> int:
     """Вернёт id существующей сдачи студента за неделю или создаст новую (status='submitted')."""
     with db() as conn:
         row = conn.execute(
@@ -139,7 +139,7 @@ def add_submission_file(
             return -1
 
 
-def list_submission_files(student_id: int, week_no: int) -> List[Dict]:
+def list_submission_files(student_id: str, week_no: int) -> List[Dict]:
     """Файлы сдачи студента за неделю (только не удалённые)."""
     with db() as conn:
         rows = conn.execute(
@@ -165,7 +165,7 @@ def list_submission_files(student_id: int, week_no: int) -> List[Dict]:
     ]
 
 
-def soft_delete_submission_file(file_id: int, student_id: int) -> bool:
+def soft_delete_submission_file(file_id: int, student_id: str) -> bool:
     """Мягкое удаление файла сдачи (проверяется, что файл принадлежит сдаче данного студента)."""
     with db() as conn:
         row = conn.execute(
@@ -186,7 +186,7 @@ def soft_delete_submission_file(file_id: int, student_id: int) -> bool:
         return True
 
 
-def list_student_weeks(student_id: int, limit: int = 20) -> List[Tuple[int, int]]:
+def list_student_weeks(student_id: str, limit: int = 20) -> List[Tuple[int, int]]:
     """
     Возвращает список (week_no, files_count) по неделям, где у студента есть сдачи.
     """
@@ -247,7 +247,7 @@ def list_students_with_submissions_by_week(week_no: int) -> List[Dict]:
         ).fetchall()
     return [
         {
-            "student_id": int(r[0]),
+            "student_id": r[0],
             "tg_id": r[1],
             "name": r[2],
             "files_count": int(r[3]),
@@ -256,7 +256,7 @@ def list_students_with_submissions_by_week(week_no: int) -> List[Dict]:
     ]
 
 
-def list_week_submission_files_for_teacher(student_id: int, week_no: int) -> List[Dict]:
+def list_week_submission_files_for_teacher(student_id: str, week_no: int) -> List[Dict]:
     """Файлы сдачи студента за неделю (только не удалённые)."""
     with db() as conn:
         rows = conn.execute(
