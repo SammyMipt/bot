@@ -34,7 +34,8 @@ def _wk_key(uid: int) -> str:
 
 def _safe_get(key: str):
     try:
-        return state_store.get(key)
+        _, params = state_store.get(key)
+        return params
     except StateNotFound:
         return None
 
@@ -208,6 +209,7 @@ async def submit_week_pick(cq: types.CallbackQuery, actor: Identity):
     sub_id = get_or_create_week_submission(actor.id, week_no)
     state_store.put_at(
         _wk_key(uid),
+        "wk_submit",
         {"mode": "collecting", "week_no": week_no, "sub_id": sub_id},
         ttl_sec=900,
     )

@@ -35,7 +35,8 @@ def _amw_key(uid: int) -> str:
 
 def _safe_get(key: str) -> dict | None:
     try:
-        return state_store.get(key)
+        _, params = state_store.get(key)
+        return params
     except StateNotFound:
         return None
 
@@ -138,7 +139,10 @@ async def amw_pick_week(cq: types.CallbackQuery, actor: Identity):
     uid = _uid(cq)
     week_no = int(cq.data.split(":")[2])
     state_store.put_at(
-        _amw_key(uid), {"mode": "expect_visibility", "week_no": week_no}, ttl_sec=900
+        _amw_key(uid),
+        "amw",
+        {"mode": "expect_visibility", "week_no": week_no},
+        ttl_sec=900,
     )
     await cq.message.answer(
         f"Неделя {week_no}. Выберите видимость:", reply_markup=_visibility_keyboard()
@@ -159,7 +163,7 @@ async def amw_set_visibility(cq: types.CallbackQuery, actor: Identity):
         return await cq.answer()
     vis = cq.data.split(":")[2]
     new_state = {"mode": "expect_files", "week_no": st["week_no"], "visibility": vis}
-    state_store.put_at(_amw_key(uid), new_state, ttl_sec=900)
+    state_store.put_at(_amw_key(uid), "amw", new_state, ttl_sec=900)
     await cq.message.answer(
         "Окей. Теперь пришлите один или несколько документов для этой недели. Когда закончите — нажмите «Готово».",
         reply_markup=_done_cancel_keyboard(),
@@ -207,7 +211,7 @@ async def amw_receive_file(m: types.Message, actor: Identity):
         visibility=st["visibility"],
     )
     # продлеваем TTL после действия
-    state_store.put_at(_amw_key(uid), st, ttl_sec=900)
+    state_store.put_at(_amw_key(uid), "amw", st, ttl_sec=900)
     if mid == -1:
         await m.answer(
             "⚠️ Такой материал уже загружен ранее (тот же файл).",
@@ -296,7 +300,7 @@ async def imp_select_mode(cq: types.CallbackQuery, actor: Identity):
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
     mode = "teachers" if cq.data.endswith("teachers") else "students"
-    state_store.put_at(_imp_key(uid), {"mode": mode}, ttl_sec=900)
+    state_store.put_at(_imp_key(uid), "imp", {"mode": mode}, ttl_sec=900)
     if mode == "teachers":
         headers = ",".join(TEACHER_HEADERS)
         await cq.message.answer(

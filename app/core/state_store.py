@@ -1,7 +1,7 @@
 import json
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 from app.core.errors import StateExpired, StateNotFound, StateRoleMismatch
 from app.db.conn import db
@@ -18,7 +18,7 @@ def _ensure_table():
     with db() as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS state_store ("
-            "key TEXT PRIMARY KEY, role TEXT, value_json TEXT NOT NULL, "
+            "key TEXT PRIMARY KEY, role TEXT, action TEXT, params TEXT, "
             "created_at_utc INTEGER NOT NULL, expires_at_utc INTEGER NOT NULL)"
         )
 
@@ -28,63 +28,78 @@ def gen_key() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def put(value: Any, role: Optional[str] = None, ttl_sec: int = DEFAULT_TTL_SEC) -> str:
-    """Store value with optional role restriction. Returns a generated key."""
+def put(
+    action: str,
+    params: Any,
+    role: Optional[str] = None,
+    ttl_sec: int = DEFAULT_TTL_SEC,
+) -> str:
+    """Store action/params with optional role restriction. Returns a generated key."""
     _ensure_table()
     k = gen_key()
     created = now()
     expires = created + max(1, ttl_sec)
-    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
     with db() as conn:
         conn.execute(
-            "INSERT INTO state_store(key, role, value_json, created_at_utc, expires_at_utc) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (k, role, payload, created, expires),
+            "INSERT INTO state_store(key, role, action, params, created_at_utc, expires_at_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (k, role, action, payload, created, expires),
         )
         conn.commit()
     return k
 
 
 def put_at(
-    key: str, value: Any, role: Optional[str] = None, ttl_sec: int = DEFAULT_TTL_SEC
+    key: str,
+    action: str,
+    params: Any,
+    role: Optional[str] = None,
+    ttl_sec: int = DEFAULT_TTL_SEC,
 ) -> None:
-    """Store value under a provided key (overwrites if exists)."""
+    """Store action/params under a provided key (overwrites if exists)."""
     _ensure_table()
     created = now()
     expires = created + max(1, ttl_sec)
-    payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps(params, ensure_ascii=False, separators=(",", ":"))
     with db() as conn:
         conn.execute(
             """
-            INSERT INTO state_store(key, role, value_json, created_at_utc, expires_at_utc)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO state_store(key, role, action, params, created_at_utc, expires_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET
               role=excluded.role,
-              value_json=excluded.value_json,
+              action=excluded.action,
+              params=excluded.params,
               created_at_utc=excluded.created_at_utc,
               expires_at_utc=excluded.expires_at_utc
             """,
-            (key, role, payload, created, expires),
+            (key, role, action, payload, created, expires),
         )
         conn.commit()
 
 
-def get(key: str, expected_role: Optional[str] = None) -> Any:
+def get(key: str, expected_role: Optional[str] = None) -> Tuple[str, Any]:
     _ensure_table()
     with db() as conn:
         row = conn.execute(
-            "SELECT role, value_json, expires_at_utc FROM state_store WHERE key = ?",
+            "SELECT role, action, params, expires_at_utc FROM state_store WHERE key = ?",
             (key,),
         ).fetchone()
     if row is None:
         raise StateNotFound("state key not found")
-    role, value_json, expires = row["role"], row["value_json"], row["expires_at_utc"]
+    role, action, params, expires = (
+        row["role"],
+        row["action"],
+        row["params"],
+        row["expires_at_utc"],
+    )
     if expires < now():
         delete(key)
         raise StateExpired("state key expired")
     if expected_role and role and expected_role != role:
         raise StateRoleMismatch(f"expected role {expected_role}, got {role}")
-    return json.loads(value_json)
+    return action, json.loads(params)
 
 
 def delete(key: str) -> None:

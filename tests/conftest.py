@@ -36,4 +36,11 @@ def db_tmpdir(tmp_path, monkeypatch):
         c.executescript(sql)
         c.commit()
 
+    mig_path2 = pathlib.Path("migrations/003_state_store_action_params.sql")
+    if mig_path2.exists():
+        sql2 = mig_path2.read_text(encoding="utf-8")
+        with conn.db() as c:
+            c.executescript(sql2)
+            c.commit()
+
     return tmp_path

@@ -27,7 +27,8 @@ def _reg_key(uid: int) -> str:
 
 def _safe_get(key: str) -> dict | None:
     try:
-        return state_store.get(key)
+        _, params = state_store.get(key)
+        return params
     except StateNotFound:
         return None
 
@@ -97,7 +98,10 @@ async def reg_teacher(cq: types.CallbackQuery, actor: Identity):
         return
     uid = _uid(cq)
     state_store.put_at(
-        _reg_key(uid), {"role": "t", "step": "code", "attempts": 0}, ttl_sec=900
+        _reg_key(uid),
+        "reg",
+        {"role": "t", "step": "code", "attempts": 0},
+        ttl_sec=900,
     )
     await cq.message.answer(
         "Введите секретный код курса:",
@@ -117,7 +121,10 @@ async def reg_student(cq: types.CallbackQuery, actor: Identity):
         return
     uid = _uid(cq)
     state_store.put_at(
-        _reg_key(uid), {"role": "s", "step": "email", "attempts": 0}, ttl_sec=900
+        _reg_key(uid),
+        "reg",
+        {"role": "s", "step": "email", "attempts": 0},
+        ttl_sec=900,
     )
     await cq.message.answer(
         "Введите e-mail, указанный при регистрации у владельца (3 попытки):",
@@ -152,6 +159,7 @@ async def reg_input_text(m: types.Message, actor: Identity):
             attempts += 1
             state_store.put_at(
                 _reg_key(uid),
+                "reg",
                 {"role": "t", "step": "code", "attempts": attempts},
                 ttl_sec=900,
             )
@@ -180,6 +188,7 @@ async def reg_input_text(m: types.Message, actor: Identity):
             cand = candidates[0]
             state_store.put_at(
                 _reg_key(uid),
+                "reg",
                 {"role": "t", "step": "confirm", "user_id": cand["id"]},
                 ttl_sec=900,
             )
@@ -205,6 +214,7 @@ async def reg_input_text(m: types.Message, actor: Identity):
         ids = [c["id"] for c in candidates]
         state_store.put_at(
             _reg_key(uid),
+            "reg",
             {"role": "t", "step": "list", "page": 0, "ids": ids},
             ttl_sec=900,
         )
@@ -217,6 +227,7 @@ async def reg_input_text(m: types.Message, actor: Identity):
             attempts += 1
             state_store.put_at(
                 _reg_key(uid),
+                "reg",
                 {"role": "s", "step": "email", "attempts": attempts},
                 ttl_sec=900,
             )
@@ -241,6 +252,7 @@ async def reg_input_text(m: types.Message, actor: Identity):
             cand = candidates[0]
             state_store.put_at(
                 _reg_key(uid),
+                "reg",
                 {"role": "s", "step": "confirm", "user_id": cand["id"]},
                 ttl_sec=900,
             )
@@ -268,6 +280,7 @@ async def reg_input_text(m: types.Message, actor: Identity):
         ids = [c["id"] for c in candidates]
         state_store.put_at(
             _reg_key(uid),
+            "reg",
             {"role": "s", "step": "list", "page": 0, "ids": ids},
             ttl_sec=900,
         )
@@ -284,12 +297,18 @@ async def reg_retry(cq: types.CallbackQuery, actor: Identity):
     step = st.get("step")
     if role == "t" and step in ("code", "list", "confirm"):
         state_store.put_at(
-            _reg_key(uid), {"role": "t", "step": "code", "attempts": 0}, ttl_sec=900
+            _reg_key(uid),
+            "reg",
+            {"role": "t", "step": "code", "attempts": 0},
+            ttl_sec=900,
         )
         await cq.message.answer("Введите секретный код курса:")
     elif role == "s" and step in ("email", "list", "confirm"):
         state_store.put_at(
-            _reg_key(uid), {"role": "s", "step": "email", "attempts": 0}, ttl_sec=900
+            _reg_key(uid),
+            "reg",
+            {"role": "s", "step": "email", "attempts": 0},
+            ttl_sec=900,
         )
         await cq.message.answer("Введите e-mail, указанный в LMS:")
     else:
@@ -304,7 +323,7 @@ async def reg_back(cq: types.CallbackQuery, actor: Identity):
     role = st.get("role")
     if role:
         # go back to role selection
-        state_store.put_at(_reg_key(uid), {"step": "choose"}, ttl_sec=900)
+        state_store.put_at(_reg_key(uid), "reg", {"step": "choose"}, ttl_sec=900)
     await cq.message.answer("Кем вы являетесь?", reply_markup=_start_keyboard())
     await cq.answer()
 
@@ -384,6 +403,7 @@ async def reg_page(cq: types.CallbackQuery, actor: Identity):
         return
     state_store.put_at(
         _reg_key(uid),
+        "reg",
         {"role": role, "step": "list", "page": page, "ids": ids},
         ttl_sec=900,
     )
@@ -404,6 +424,7 @@ async def reg_pick(cq: types.CallbackQuery, actor: Identity):
     user_id = cq.data.split(":")[2]
     state_store.put_at(
         _reg_key(uid),
+        "reg",
         {"role": role, "step": "confirm", "user_id": user_id},
         ttl_sec=900,
     )
