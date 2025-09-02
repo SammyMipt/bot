@@ -1,4 +1,4 @@
-.PHONY: init dev run-bot lint fmt test doctor dirs migrate seed clean-db
+.PHONY: init dev run-bot lint fmt test doctor dirs migrate seed clean-db fix-eol
 
 PY=poetry run
 DEV_DIRS=var var/materials var/submissions var/exports var/tmp var/logs
@@ -13,7 +13,7 @@ run-bot:
 	$(PY) python -m app.bot.main
 
 lint:
-	poetry run flake8 app
+	poetry run flake8 -j1 app
 
 fmt:
 	poetry run black app tests && poetry run isort app tests
@@ -47,3 +47,25 @@ ci: fmt lint test
 test-cov:
 	poetry run pytest -q --maxfail=1 --disable-warnings \
 		--cov=app --cov=scripts --cov-report=term-missing:skip-covered
+
+fix-eol:
+	python - <<'PY'
+import pathlib
+skip_dirs = {'.git', '.venv', 'var'}
+exts = {'.py', '.sql', '.yml', '.yaml', '.toml', '.md'}
+fixed = 0
+for p in pathlib.Path('.').rglob('*'):
+    if not p.is_file():
+        continue
+    if any(part in skip_dirs for part in p.parts):
+        continue
+    if p.suffix not in exts:
+        continue
+    b = p.read_bytes()
+    nb = b.replace(b'\r\n', b'\n')
+    if nb != b:
+        p.write_bytes(nb)
+        fixed += 1
+        print(f"fixed {p}")
+print(f"done, fixed={fixed}")
+PY
