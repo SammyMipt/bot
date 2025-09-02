@@ -3,7 +3,7 @@ from __future__ import annotations
 from aiogram import F, Router, types
 from aiogram.filters import Command
 
-from app.core import state_store
+from app.core import callbacks, state_store
 from app.core.auth import Identity
 from app.core.errors import StateNotFound
 from app.core.files import save_blob
@@ -23,6 +23,20 @@ except Exception:  # pragma: no cover
     BufferedInputFile = None  # type: ignore
 
 router = Router(name="epic4.owner")
+
+
+def _cb(op: str, actions: set[str]):
+    def _f(cq: types.CallbackQuery) -> bool:
+        try:
+            op2, key = callbacks.parse(cq.data)
+            if op2 != op:
+                return False
+            _, payload = state_store.get(key)
+            return payload.get("action") in actions
+        except Exception:
+            return False
+
+    return _f
 
 
 def _uid(x: types.Message | types.CallbackQuery) -> int:
@@ -58,7 +72,12 @@ def _weeks_keyboard(page: int = 0) -> types.InlineKeyboardMarkup:
     row: list[types.InlineKeyboardButton] = []
     for n in chunk:
         row.append(
-            types.InlineKeyboardButton(text=f"W{n}", callback_data=f"amw:week:{n}")
+            types.InlineKeyboardButton(
+                text=f"W{n}",
+                callback_data=callbacks.build(
+                    "amw", {"action": "week", "params": {"week": n}}
+                ),
+            )
         )
         if len(row) == row_size:
             rows.append(row)
@@ -71,13 +90,19 @@ def _weeks_keyboard(page: int = 0) -> types.InlineKeyboardMarkup:
         if page > 0:
             nav.append(
                 types.InlineKeyboardButton(
-                    text="« Назад", callback_data=f"amw:page:{page - 1}"
+                    text="« Назад",
+                    callback_data=callbacks.build(
+                        "amw", {"action": "page", "params": {"page": page - 1}}
+                    ),
                 )
             )
         if page < total_pages - 1:
             nav.append(
                 types.InlineKeyboardButton(
-                    text="Вперёд »", callback_data=f"amw:page:{page + 1}"
+                    text="Вперёд »",
+                    callback_data=callbacks.build(
+                        "amw", {"action": "page", "params": {"page": page + 1}}
+                    ),
                 )
             )
         if nav:
@@ -90,10 +115,20 @@ def _visibility_keyboard() -> types.InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
-                    text="Студентам (public)", callback_data="amw:vis:public"
+                    text="Студентам (public)",
+                    callback_data=callbacks.build(
+                        "amw", {"action": "vis", "params": {"vis": "public"}}
+                    ),
                 ),
                 types.InlineKeyboardButton(
-                    text="Только преподам", callback_data="amw:vis:teacher_only"
+                    text="Только преподам",
+                    callback_data=callbacks.build(
+                        "amw",
+                        {
+                            "action": "vis",
+                            "params": {"vis": "teacher_only"},
+                        },
+                    ),
                 ),
             ]
         ]
@@ -104,8 +139,18 @@ def _done_cancel_keyboard() -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                types.InlineKeyboardButton(text="Готово", callback_data="amw:done"),
-                types.InlineKeyboardButton(text="Отмена", callback_data="amw:cancel"),
+                types.InlineKeyboardButton(
+                    text="Готово",
+                    callback_data=callbacks.build(
+                        "amw", {"action": "done", "params": {}}
+                    ),
+                ),
+                types.InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=callbacks.build(
+                        "amw", {"action": "cancel", "params": {}}
+                    ),
+                ),
             ]
         ]
     )
@@ -118,11 +163,12 @@ async def add_material_week_start(m: types.Message, actor: Identity):
     await m.answer("Выберите неделю:", reply_markup=_weeks_keyboard(page=0))
 
 
-@router.callback_query(F.data.regexp(r"^amw:page:(\d+)$"))
+@router.callback_query(_cb("amw", {"page"}))
 async def amw_page(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
-    page = int(cq.data.split(":")[2])
+    _, payload = callbacks.extract(cq.data)
+    page = int(payload["params"].get("page", 0))
     try:
         await cq.message.edit_reply_markup(reply_markup=_weeks_keyboard(page=page))
     except Exception:
@@ -132,12 +178,13 @@ async def amw_page(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(F.data.regexp(r"^amw:week:(\d+)$"))
+@router.callback_query(_cb("amw", {"week"}))
 async def amw_pick_week(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
-    week_no = int(cq.data.split(":")[2])
+    _, payload = callbacks.extract(cq.data)
+    week_no = int(payload["params"].get("week", 0))
     state_store.put_at(
         _amw_key(uid),
         "amw",
@@ -150,7 +197,7 @@ async def amw_pick_week(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(F.data.regexp(r"^amw:vis:(public|teacher_only)$"))
+@router.callback_query(_cb("amw", {"vis"}))
 async def amw_set_visibility(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
@@ -161,7 +208,8 @@ async def amw_set_visibility(cq: types.CallbackQuery, actor: Identity):
             "Сначала начните с /add_material_week и выберите неделю."
         )
         return await cq.answer()
-    vis = cq.data.split(":")[2]
+    _, payload = callbacks.extract(cq.data)
+    vis = payload["params"].get("vis")
     new_state = {"mode": "expect_files", "week_no": st["week_no"], "visibility": vis}
     state_store.put_at(_amw_key(uid), "amw", new_state, ttl_sec=900)
     await cq.message.answer(
@@ -224,21 +272,23 @@ async def amw_receive_file(m: types.Message, actor: Identity):
         )
 
 
-@router.callback_query(F.data == "amw:done")
+@router.callback_query(_cb("amw", {"done"}))
 async def amw_done(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
+    callbacks.extract(cq.data)
     state_store.delete(_amw_key(uid))
     await cq.message.answer("Готово. Добавление материалов завершено.")
     await cq.answer()
 
 
-@router.callback_query(F.data == "amw:cancel")
+@router.callback_query(_cb("amw", {"cancel"}))
 async def amw_cancel(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
+    callbacks.extract(cq.data)
     state_store.delete(_amw_key(uid))
     await cq.message.answer("Ок, отменил. Ничего не сохранил.")
     await cq.answer()
@@ -267,17 +317,31 @@ def _import_menu_keyboard() -> types.InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
-                    text="Импорт преподавателей", callback_data="imp:teachers"
+                    text="Импорт преподавателей",
+                    callback_data=callbacks.build(
+                        "imp", {"action": "teachers", "params": {}}
+                    ),
                 ),
                 types.InlineKeyboardButton(
-                    text="Импорт студентов", callback_data="imp:students"
+                    text="Импорт студентов",
+                    callback_data=callbacks.build(
+                        "imp", {"action": "students", "params": {}}
+                    ),
                 ),
             ],
             [
                 types.InlineKeyboardButton(
-                    text="Скачать шаблоны", callback_data="imp:templates"
+                    text="Скачать шаблоны",
+                    callback_data=callbacks.build(
+                        "imp", {"action": "templates", "params": {}}
+                    ),
                 ),
-                types.InlineKeyboardButton(text="Сводка", callback_data="imp:summary"),
+                types.InlineKeyboardButton(
+                    text="Сводка",
+                    callback_data=callbacks.build(
+                        "imp", {"action": "summary", "params": {}}
+                    ),
+                ),
             ],
         ]
     )
@@ -294,12 +358,13 @@ async def import_data_menu(m: types.Message, actor: Identity):
     await m.answer("📥 Импорт данных:", reply_markup=_import_menu_keyboard())
 
 
-@router.callback_query(F.data.in_({"imp:teachers", "imp:students"}))
+@router.callback_query(_cb("imp", {"teachers", "students"}))
 async def imp_select_mode(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
-    mode = "teachers" if cq.data.endswith("teachers") else "students"
+    _, payload = callbacks.extract(cq.data)
+    mode = payload.get("action")
     state_store.put_at(_imp_key(uid), "imp", {"mode": mode}, ttl_sec=900)
     if mode == "teachers":
         headers = ",".join(TEACHER_HEADERS)
@@ -359,10 +424,11 @@ async def imp_receive_csv(m: types.Message, actor: Identity):
         await m.answer("\n".join(lines))
 
 
-@router.callback_query(F.data == "imp:templates")
+@router.callback_query(_cb("imp", {"templates"}))
 async def imp_templates(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
+    callbacks.extract(cq.data)
     tpls = get_templates()
     if BufferedInputFile is not None:
         await cq.message.answer_document(
@@ -378,10 +444,11 @@ async def imp_templates(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(F.data == "imp:summary")
+@router.callback_query(_cb("imp", {"summary"}))
 async def imp_summary(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
+    callbacks.extract(cq.data)
     s = get_users_summary()
     lines = [
         "Сводка пользователей:",

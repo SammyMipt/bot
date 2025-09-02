@@ -6,7 +6,7 @@ import re
 from aiogram import F, Router, types
 from aiogram.filters import CommandStart
 
-from app.core import state_store
+from app.core import callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
 from app.core.config import cfg
 from app.core.errors import StateNotFound
@@ -15,6 +15,20 @@ from app.db.conn import db
 
 router = Router(name="epic5.register")
 log = logging.getLogger(__name__)
+
+
+def _cb(op: str, actions: set[str]):
+    def _f(cq: types.CallbackQuery) -> bool:
+        try:
+            op2, key = callbacks.parse(cq.data)
+            if op2 != op:
+                return False
+            _, payload = state_store.get(key)
+            return payload.get("action") in actions
+        except Exception:
+            return False
+
+    return _f
 
 
 def _uid(x: types.Message | types.CallbackQuery) -> int:
@@ -38,10 +52,16 @@ def _start_keyboard() -> types.InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
-                    text="👨‍🏫 Преподаватель", callback_data="reg:t:role"
+                    text="👨‍🏫 Преподаватель",
+                    callback_data=callbacks.build(
+                        "reg", {"action": "t_role", "params": {}}
+                    ),
                 ),
                 types.InlineKeyboardButton(
-                    text="🎓 Студент", callback_data="reg:s:role"
+                    text="🎓 Студент",
+                    callback_data=callbacks.build(
+                        "reg", {"action": "s_role", "params": {}}
+                    ),
                 ),
             ]
         ]
@@ -52,8 +72,18 @@ def _retry_cancel_kb() -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                types.InlineKeyboardButton(text="Повторить", callback_data="reg:retry"),
-                types.InlineKeyboardButton(text="⬅️ Назад", callback_data="reg:back"),
+                types.InlineKeyboardButton(
+                    text="Повторить",
+                    callback_data=callbacks.build(
+                        "reg", {"action": "retry", "params": {}}
+                    ),
+                ),
+                types.InlineKeyboardButton(
+                    text="⬅️ Назад",
+                    callback_data=callbacks.build(
+                        "reg", {"action": "back", "params": {}}
+                    ),
+                ),
             ]
         ]
     )
@@ -80,8 +110,9 @@ async def start(m: types.Message, actor: Identity):
     )
 
 
-@router.callback_query(F.data == "reg:menu")
+@router.callback_query(_cb("reg", {"menu"}))
 async def reg_menu(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data)
     uid = _uid(cq)
     try:
         state_store.delete(_reg_key(uid))
@@ -91,8 +122,9 @@ async def reg_menu(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(F.data == "reg:t:role")
+@router.callback_query(_cb("reg", {"t_role"}))
 async def reg_teacher(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data)
     if get_user_by_tg(_eff_tg_id(cq.from_user.id)):
         await cq.answer("Уже зарегистрированы", show_alert=True)
         return
@@ -107,15 +139,23 @@ async def reg_teacher(cq: types.CallbackQuery, actor: Identity):
         "Введите секретный код курса:",
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
-                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="reg:back")]
+                [
+                    types.InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data=callbacks.build(
+                            "reg", {"action": "back", "params": {}}
+                        ),
+                    )
+                ]
             ]
         ),
     )
     await cq.answer()
 
 
-@router.callback_query(F.data == "reg:s:role")
+@router.callback_query(_cb("reg", {"s_role"}))
 async def reg_student(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data)
     if get_user_by_tg(_eff_tg_id(cq.from_user.id)):
         await cq.answer("Уже зарегистрированы", show_alert=True)
         return
@@ -130,7 +170,14 @@ async def reg_student(cq: types.CallbackQuery, actor: Identity):
         "Введите e-mail, указанный при регистрации у владельца (3 попытки):",
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
-                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="reg:back")]
+                [
+                    types.InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data=callbacks.build(
+                            "reg", {"action": "back", "params": {}}
+                        ),
+                    )
+                ]
             ]
         ),
     )
@@ -198,12 +245,18 @@ async def reg_input_text(m: types.Message, actor: Identity):
                     inline_keyboard=[
                         [
                             types.InlineKeyboardButton(
-                                text="Подтвердить", callback_data="reg:confirm:yes"
+                                text="Подтвердить",
+                                callback_data=callbacks.build(
+                                    "reg", {"action": "confirm_yes", "params": {}}
+                                ),
                             )
                         ],
                         [
                             types.InlineKeyboardButton(
-                                text="⬅️ Назад", callback_data="reg:back"
+                                text="⬅️ Назад",
+                                callback_data=callbacks.build(
+                                    "reg", {"action": "back", "params": {}}
+                                ),
                             )
                         ],
                     ]
@@ -265,12 +318,18 @@ async def reg_input_text(m: types.Message, actor: Identity):
                     inline_keyboard=[
                         [
                             types.InlineKeyboardButton(
-                                text="Подтвердить", callback_data="reg:confirm:yes"
+                                text="Подтвердить",
+                                callback_data=callbacks.build(
+                                    "reg", {"action": "confirm_yes", "params": {}}
+                                ),
                             )
                         ],
                         [
                             types.InlineKeyboardButton(
-                                text="⬅️ Назад", callback_data="reg:back"
+                                text="⬅️ Назад",
+                                callback_data=callbacks.build(
+                                    "reg", {"action": "back", "params": {}}
+                                ),
                             )
                         ],
                     ]
@@ -289,8 +348,9 @@ async def reg_input_text(m: types.Message, actor: Identity):
     # no active registration state — ignore
 
 
-@router.callback_query(F.data == "reg:retry")
+@router.callback_query(_cb("reg", {"retry"}))
 async def reg_retry(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data)
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     role = st.get("role")
@@ -316,8 +376,9 @@ async def reg_retry(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(F.data == "reg:back")
+@router.callback_query(_cb("reg", {"back"}))
 async def reg_back(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data)
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     role = st.get("role")
@@ -358,24 +419,44 @@ def _list_keyboard(
     for uid in chunk:
         txt = labels.get(uid, f"ID {uid}")
         rows.append(
-            [types.InlineKeyboardButton(text=txt, callback_data=f"reg:pick:{uid}")]
+            [
+                types.InlineKeyboardButton(
+                    text=txt,
+                    callback_data=callbacks.build(
+                        "reg", {"action": "pick", "params": {"uid": uid}}
+                    ),
+                )
+            ]
         )
     nav: list[types.InlineKeyboardButton] = []
     if page > 0:
         nav.append(
             types.InlineKeyboardButton(
-                text="« Назад", callback_data=f"reg:page:{page - 1}"
+                text="« Назад",
+                callback_data=callbacks.build(
+                    "reg", {"action": "page", "params": {"page": page - 1}}
+                ),
             )
         )
     if page < total_pages - 1:
         nav.append(
             types.InlineKeyboardButton(
-                text="Вперёд »", callback_data=f"reg:page:{page + 1}"
+                text="Вперёд »",
+                callback_data=callbacks.build(
+                    "reg", {"action": "page", "params": {"page": page + 1}}
+                ),
             )
         )
     if nav:
         rows.append(nav)
-    rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="reg:back")])
+    rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=callbacks.build("reg", {"action": "back", "params": {}}),
+            )
+        ]
+    )
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -391,11 +472,12 @@ async def _send_candidates_list(m: types.Message, role: str, page: int, ids: lis
     await m.answer(header, reply_markup=_list_keyboard(role, page, total_pages, ids))
 
 
-@router.callback_query(F.data.regexp(r"^reg:page:(\d+)$"))
+@router.callback_query(_cb("reg", {"page"}))
 async def reg_page(cq: types.CallbackQuery, actor: Identity):
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
-    page = int(cq.data.split(":")[2])
+    _, payload = callbacks.extract(cq.data)
+    page = int(payload["params"].get("page", 0))
     ids = st.get("ids") or []
     role = st.get("role") or "s"
     if not ids:
@@ -416,12 +498,13 @@ async def reg_page(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(F.data.regexp(r"^reg:pick:([\w-]+)$"))
+@router.callback_query(_cb("reg", {"pick"}))
 async def reg_pick(cq: types.CallbackQuery, actor: Identity):
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     role = st.get("role") or "s"
-    user_id = cq.data.split(":")[2]
+    _, payload = callbacks.extract(cq.data)
+    user_id = payload["params"].get("uid")
     state_store.put_at(
         _reg_key(uid),
         "reg",
@@ -434,18 +517,29 @@ async def reg_pick(cq: types.CallbackQuery, actor: Identity):
             inline_keyboard=[
                 [
                     types.InlineKeyboardButton(
-                        text="Подтвердить", callback_data="reg:confirm:yes"
+                        text="Подтвердить",
+                        callback_data=callbacks.build(
+                            "reg", {"action": "confirm_yes", "params": {}}
+                        ),
                     )
                 ],
-                [types.InlineKeyboardButton(text="⬅️ Назад", callback_data="reg:back")],
+                [
+                    types.InlineKeyboardButton(
+                        text="⬅️ Назад",
+                        callback_data=callbacks.build(
+                            "reg", {"action": "back", "params": {}}
+                        ),
+                    )
+                ],
             ]
         ),
     )
     await cq.answer()
 
 
-@router.callback_query(F.data == "reg:confirm:yes")
+@router.callback_query(_cb("reg", {"confirm_yes"}))
 async def reg_confirm(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data)
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     user_id = st.get("user_id")
