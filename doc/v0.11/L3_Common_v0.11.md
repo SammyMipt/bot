@@ -29,7 +29,7 @@ YYYY-MM-DD HH:MM (Europe/Moscow) · у вас сейчас ≈ HH:MM
 
 **Схема (SQLite):**
 - `state_store(`
-  `key TEXT PRIMARY KEY,`          — UUID v4 (36 символов)
+  `key TEXT PRIMARY KEY,`          — короткий ключ (12-символьный hex из `uuid4().hex[:12]`)
   `role TEXT NOT NULL,`            — {owner|teacher|student|system}
   `action TEXT NOT NULL,`          — короткий код операции (напр., "sl_appl")
   `params TEXT NOT NULL,`          — JSON-строка с параметрами
@@ -54,15 +54,15 @@ YYYY-MM-DD HH:MM (Europe/Moscow) · у вас сейчас ≈ HH:MM
 
 ---
 ## 4. Callback codec (≤64B)
-**Стратегия:** `callback_data = "{op}:{uuid}"`
+**Стратегия:** `callback_data = "{op}:{key}"`
 - `op` — короткий код (напр., `"sl_appl"` = apply slot, `"sl_rm"` = remove slot).
-- `uuid` — ключ в `state_store.key`.
+- `key` — короткий ключ (12-символьный hex), совпадает с `state_store.key`.
 
 **Правила:**
 1) Никаких JSON в `callback_data`.
 2) Любые параметры — в `state_store.params` (JSON).
 3) Хендлер:
-   - парсит `op/uuid`,
+   - парсит `op/key`,
    - читает запись из `state_store`,
    - валидирует роль/TTL,
    - действует по `action/params`.

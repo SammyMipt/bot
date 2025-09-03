@@ -59,7 +59,7 @@ def _is_owner_or_teacher(actor: Identity) -> bool:
     return actor.role in ("owner", "teacher")
 
 
-def _weeks_keyboard(page: int = 0) -> types.InlineKeyboardMarkup:
+def _weeks_keyboard(role: str, page: int = 0) -> types.InlineKeyboardMarkup:
     weeks = list_weeks(limit=200)
     per_page = 28
     row_size = 7
@@ -75,7 +75,7 @@ def _weeks_keyboard(page: int = 0) -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton(
                 text=f"W{n}",
                 callback_data=callbacks.build(
-                    "amw", {"action": "week", "params": {"week": n}}
+                    "amw", {"action": "week", "params": {"week": n}}, role=role
                 ),
             )
         )
@@ -92,7 +92,9 @@ def _weeks_keyboard(page: int = 0) -> types.InlineKeyboardMarkup:
                 types.InlineKeyboardButton(
                     text="« Назад",
                     callback_data=callbacks.build(
-                        "amw", {"action": "page", "params": {"page": page - 1}}
+                        "amw",
+                        {"action": "page", "params": {"page": page - 1}},
+                        role=role,
                     ),
                 )
             )
@@ -101,7 +103,9 @@ def _weeks_keyboard(page: int = 0) -> types.InlineKeyboardMarkup:
                 types.InlineKeyboardButton(
                     text="Вперёд »",
                     callback_data=callbacks.build(
-                        "amw", {"action": "page", "params": {"page": page + 1}}
+                        "amw",
+                        {"action": "page", "params": {"page": page + 1}},
+                        role=role,
                     ),
                 )
             )
@@ -110,14 +114,16 @@ def _weeks_keyboard(page: int = 0) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _visibility_keyboard() -> types.InlineKeyboardMarkup:
+def _visibility_keyboard(role: str) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
                     text="Студентам (public)",
                     callback_data=callbacks.build(
-                        "amw", {"action": "vis", "params": {"vis": "public"}}
+                        "amw",
+                        {"action": "vis", "params": {"vis": "public"}},
+                        role=role,
                     ),
                 ),
                 types.InlineKeyboardButton(
@@ -128,6 +134,7 @@ def _visibility_keyboard() -> types.InlineKeyboardMarkup:
                             "action": "vis",
                             "params": {"vis": "teacher_only"},
                         },
+                        role=role,
                     ),
                 ),
             ]
@@ -135,20 +142,20 @@ def _visibility_keyboard() -> types.InlineKeyboardMarkup:
     )
 
 
-def _done_cancel_keyboard() -> types.InlineKeyboardMarkup:
+def _done_cancel_keyboard(role: str) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
                     text="Готово",
                     callback_data=callbacks.build(
-                        "amw", {"action": "done", "params": {}}
+                        "amw", {"action": "done", "params": {}}, role=role
                     ),
                 ),
                 types.InlineKeyboardButton(
                     text="Отмена",
                     callback_data=callbacks.build(
-                        "amw", {"action": "cancel", "params": {}}
+                        "amw", {"action": "cancel", "params": {}}, role=role
                     ),
                 ),
             ]
@@ -160,20 +167,22 @@ def _done_cancel_keyboard() -> types.InlineKeyboardMarkup:
 async def add_material_week_start(m: types.Message, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await m.answer("Недостаточно прав.")
-    await m.answer("Выберите неделю:", reply_markup=_weeks_keyboard(page=0))
+    await m.answer("Выберите неделю:", reply_markup=_weeks_keyboard(actor.role, page=0))
 
 
 @router.callback_query(_cb("amw", {"page"}))
 async def amw_page(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
-    _, payload = callbacks.extract(cq.data)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     page = int(payload["params"].get("page", 0))
     try:
-        await cq.message.edit_reply_markup(reply_markup=_weeks_keyboard(page=page))
+        await cq.message.edit_reply_markup(
+            reply_markup=_weeks_keyboard(actor.role, page=page)
+        )
     except Exception:
         await cq.message.answer(
-            "Выберите неделю:", reply_markup=_weeks_keyboard(page=page)
+            "Выберите неделю:", reply_markup=_weeks_keyboard(actor.role, page=page)
         )
     await cq.answer()
 
@@ -183,7 +192,7 @@ async def amw_pick_week(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
-    _, payload = callbacks.extract(cq.data)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     week_no = int(payload["params"].get("week", 0))
     state_store.put_at(
         _amw_key(uid),
@@ -192,7 +201,8 @@ async def amw_pick_week(cq: types.CallbackQuery, actor: Identity):
         ttl_sec=900,
     )
     await cq.message.answer(
-        f"Неделя {week_no}. Выберите видимость:", reply_markup=_visibility_keyboard()
+        f"Неделя {week_no}. Выберите видимость:",
+        reply_markup=_visibility_keyboard(actor.role),
     )
     await cq.answer()
 
@@ -208,13 +218,13 @@ async def amw_set_visibility(cq: types.CallbackQuery, actor: Identity):
             "Сначала начните с /add_material_week и выберите неделю."
         )
         return await cq.answer()
-    _, payload = callbacks.extract(cq.data)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     vis = payload["params"].get("vis")
     new_state = {"mode": "expect_files", "week_no": st["week_no"], "visibility": vis}
     state_store.put_at(_amw_key(uid), "amw", new_state, ttl_sec=900)
     await cq.message.answer(
         "Окей. Теперь пришлите один или несколько документов для этой недели. Когда закончите — нажмите «Готово».",
-        reply_markup=_done_cancel_keyboard(),
+        reply_markup=_done_cancel_keyboard(actor.role),
     )
     await cq.answer()
 
@@ -263,12 +273,12 @@ async def amw_receive_file(m: types.Message, actor: Identity):
     if mid == -1:
         await m.answer(
             "⚠️ Такой материал уже загружен ранее (тот же файл).",
-            reply_markup=_done_cancel_keyboard(),
+            reply_markup=_done_cancel_keyboard(actor.role),
         )
     else:
         await m.answer(
             f"✅ Материал #{mid} добавлен ({st['visibility']}). Ещё файл? Или «Готово».",
-            reply_markup=_done_cancel_keyboard(),
+            reply_markup=_done_cancel_keyboard(actor.role),
         )
 
 
@@ -277,7 +287,7 @@ async def amw_done(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     state_store.delete(_amw_key(uid))
     await cq.message.answer("Готово. Добавление материалов завершено.")
     await cq.answer()
@@ -288,7 +298,7 @@ async def amw_cancel(cq: types.CallbackQuery, actor: Identity):
     if not _is_owner_or_teacher(actor):
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     state_store.delete(_amw_key(uid))
     await cq.message.answer("Ок, отменил. Ничего не сохранил.")
     await cq.answer()
@@ -312,20 +322,20 @@ async def owner_cancel_cmd(m: types.Message):
 # ========= EPIC-5: Owner Import Menu =========
 
 
-def _import_menu_keyboard() -> types.InlineKeyboardMarkup:
+def _import_menu_keyboard(role: str) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
                     text="Импорт преподавателей",
                     callback_data=callbacks.build(
-                        "imp", {"action": "teachers", "params": {}}
+                        "imp", {"action": "teachers", "params": {}}, role=role
                     ),
                 ),
                 types.InlineKeyboardButton(
                     text="Импорт студентов",
                     callback_data=callbacks.build(
-                        "imp", {"action": "students", "params": {}}
+                        "imp", {"action": "students", "params": {}}, role=role
                     ),
                 ),
             ],
@@ -333,13 +343,13 @@ def _import_menu_keyboard() -> types.InlineKeyboardMarkup:
                 types.InlineKeyboardButton(
                     text="Скачать шаблоны",
                     callback_data=callbacks.build(
-                        "imp", {"action": "templates", "params": {}}
+                        "imp", {"action": "templates", "params": {}}, role=role
                     ),
                 ),
                 types.InlineKeyboardButton(
                     text="Сводка",
                     callback_data=callbacks.build(
-                        "imp", {"action": "summary", "params": {}}
+                        "imp", {"action": "summary", "params": {}}, role=role
                     ),
                 ),
             ],
@@ -355,7 +365,7 @@ def _imp_key(uid: int) -> str:
 async def import_data_menu(m: types.Message, actor: Identity):
     if actor.role != "owner":
         return await m.answer("Недостаточно прав.")
-    await m.answer("📥 Импорт данных:", reply_markup=_import_menu_keyboard())
+    await m.answer("📥 Импорт данных:", reply_markup=_import_menu_keyboard(actor.role))
 
 
 @router.callback_query(_cb("imp", {"teachers", "students"}))
@@ -363,7 +373,7 @@ async def imp_select_mode(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
     uid = _uid(cq)
-    _, payload = callbacks.extract(cq.data)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     mode = payload.get("action")
     state_store.put_at(_imp_key(uid), "imp", {"mode": mode}, ttl_sec=900)
     if mode == "teachers":
@@ -428,7 +438,7 @@ async def imp_receive_csv(m: types.Message, actor: Identity):
 async def imp_templates(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     tpls = get_templates()
     if BufferedInputFile is not None:
         await cq.message.answer_document(
@@ -448,7 +458,7 @@ async def imp_templates(cq: types.CallbackQuery, actor: Identity):
 async def imp_summary(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     s = get_users_summary()
     lines = [
         "Сводка пользователей:",

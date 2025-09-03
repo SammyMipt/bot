@@ -17,14 +17,11 @@ router = Router(name="epic5.register")
 log = logging.getLogger(__name__)
 
 
-def _cb(op: str, actions: set[str]):
+def _op(op: str):
     def _f(cq: types.CallbackQuery) -> bool:
         try:
-            op2, key = callbacks.parse(cq.data)
-            if op2 != op:
-                return False
-            _, payload = state_store.get(key)
-            return payload.get("action") in actions
+            op2, _ = callbacks.parse(cq.data)
+            return op2 == op
         except Exception:
             return False
 
@@ -47,42 +44,36 @@ def _safe_get(key: str) -> dict | None:
         return None
 
 
-def _start_keyboard() -> types.InlineKeyboardMarkup:
+def _start_keyboard(role: str) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
-                    text="👨‍🏫 Преподаватель",
-                    callback_data=callbacks.build(
-                        "reg", {"action": "t_role", "params": {}}
-                    ),
-                ),
-                types.InlineKeyboardButton(
                     text="🎓 Студент",
-                    callback_data=callbacks.build(
-                        "reg", {"action": "s_role", "params": {}}
-                    ),
+                    callback_data=callbacks.build("reg_s_role", {}, role=role),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="👨‍🏫 Преподаватель",
+                    callback_data=callbacks.build("reg_t_role", {}, role=role),
                 ),
-            ]
+            ],
         ]
     )
 
 
-def _retry_cancel_kb() -> types.InlineKeyboardMarkup:
+def _retry_cancel_kb(role: str) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 types.InlineKeyboardButton(
-                    text="Повторить",
-                    callback_data=callbacks.build(
-                        "reg", {"action": "retry", "params": {}}
-                    ),
+                    text="🔄 Ввести заново",
+                    callback_data=callbacks.build("reg_retry", {}, role=role),
                 ),
                 types.InlineKeyboardButton(
-                    text="⬅️ Назад",
-                    callback_data=callbacks.build(
-                        "reg", {"action": "back", "params": {}}
-                    ),
+                    text="❌ Отмена",
+                    callback_data=callbacks.build("reg_back", {}, role=role),
                 ),
             ]
         ]
@@ -105,14 +96,17 @@ async def start(m: types.Message, actor: Identity):
         return
 
     await m.answer(
-        "Добро пожаловать! Кем вы являетесь?",
-        reply_markup=_start_keyboard(),
+        "👋 Добро пожаловать в курс физики для будущих ML‑специалистов!\n"
+        "Этот бот поможет вам с учёбой: вы сможете получать материалы, сдавать работы и записываться на сдачи.\n"
+        "К сожалению, мы пока не знакомы.\n"
+        "Выберите роль для регистрации:",
+        reply_markup=_start_keyboard(actor.role),
     )
 
 
-@router.callback_query(_cb("reg", {"menu"}))
+@router.callback_query(_op("reg_menu"))
 async def reg_menu(cq: types.CallbackQuery, actor: Identity):
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     uid = _uid(cq)
     try:
         state_store.delete(_reg_key(uid))
@@ -122,9 +116,9 @@ async def reg_menu(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(_cb("reg", {"t_role"}))
+@router.callback_query(_op("reg_t_role"))
 async def reg_teacher(cq: types.CallbackQuery, actor: Identity):
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     if get_user_by_tg(_eff_tg_id(cq.from_user.id)):
         await cq.answer("Уже зарегистрированы", show_alert=True)
         return
@@ -142,9 +136,7 @@ async def reg_teacher(cq: types.CallbackQuery, actor: Identity):
                 [
                     types.InlineKeyboardButton(
                         text="⬅️ Назад",
-                        callback_data=callbacks.build(
-                            "reg", {"action": "back", "params": {}}
-                        ),
+                        callback_data=callbacks.build("reg_back", {}, role=actor.role),
                     )
                 ]
             ]
@@ -153,9 +145,9 @@ async def reg_teacher(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(_cb("reg", {"s_role"}))
+@router.callback_query(_op("reg_s_role"))
 async def reg_student(cq: types.CallbackQuery, actor: Identity):
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     if get_user_by_tg(_eff_tg_id(cq.from_user.id)):
         await cq.answer("Уже зарегистрированы", show_alert=True)
         return
@@ -167,15 +159,13 @@ async def reg_student(cq: types.CallbackQuery, actor: Identity):
         ttl_sec=900,
     )
     await cq.message.answer(
-        "Введите e-mail, указанный при регистрации у владельца (3 попытки):",
+        "✉️ Введите ваш e‑mail как в LMS (Moodle):",
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     types.InlineKeyboardButton(
                         text="⬅️ Назад",
-                        callback_data=callbacks.build(
-                            "reg", {"action": "back", "params": {}}
-                        ),
+                        callback_data=callbacks.build("reg_back", {}, role=actor.role),
                     )
                 ]
             ]
@@ -213,17 +203,17 @@ async def reg_input_text(m: types.Message, actor: Identity):
             log.warning("[reg] teacher code invalid (attempt %s)", attempts)
             if attempts >= 3:
                 await m.answer(
-                    "E_SECRET_CODE_INVALID — Неверный код. Попробуйте начать заново.",
-                    reply_markup=_start_keyboard(),
+                    "⛔ Неверный код. Попробуйте начать заново.",
+                    reply_markup=_start_keyboard(actor.role),
                 )
             else:
                 await m.answer(
-                    "E_SECRET_CODE_INVALID — Неверный код.",
-                    reply_markup=_retry_cancel_kb(),
+                    "⛔ Неверный код",
+                    reply_markup=_retry_cancel_kb(actor.role),
                 )
             return
         # code OK → list free teachers
-        candidates = repo_users.find_free_teachers_for_bind()
+        candidates = repo_users.find_all_teachers_for_bind()
         if not candidates:
             log.info("[reg] teacher no candidates after valid code")
             state_store.delete(_reg_key(uid))
@@ -231,39 +221,7 @@ async def reg_input_text(m: types.Message, actor: Identity):
                 "Не найден свободный профиль преподавателя. Вы в списке непривязанных. Свяжитесь с владельцем."
             )
             return
-        if len(candidates) == 1:
-            cand = candidates[0]
-            state_store.put_at(
-                _reg_key(uid),
-                "reg",
-                {"role": "t", "step": "confirm", "user_id": cand["id"]},
-                ttl_sec=900,
-            )
-            await m.answer(
-                f"Профиль найден: {cand.get('name') or 'Без имени'}\nПодтвердить привязку?",
-                reply_markup=types.InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            types.InlineKeyboardButton(
-                                text="Подтвердить",
-                                callback_data=callbacks.build(
-                                    "reg", {"action": "confirm_yes", "params": {}}
-                                ),
-                            )
-                        ],
-                        [
-                            types.InlineKeyboardButton(
-                                text="⬅️ Назад",
-                                callback_data=callbacks.build(
-                                    "reg", {"action": "back", "params": {}}
-                                ),
-                            )
-                        ],
-                    ]
-                ),
-            )
-            return
-        # multiple candidates — paginate
+        # always show list — paginate
         ids = [c["id"] for c in candidates]
         state_store.put_at(
             _reg_key(uid),
@@ -287,19 +245,26 @@ async def reg_input_text(m: types.Message, actor: Identity):
             msg = "Некорректный e-mail."
             if attempts >= 3:
                 await m.answer(
-                    msg + " Попробуйте начать заново.", reply_markup=_start_keyboard()
+                    msg + " Попробуйте начать заново.",
+                    reply_markup=_start_keyboard(actor.role),
                 )
             else:
-                await m.answer(msg, reply_markup=_retry_cancel_kb())
+                await m.answer(msg, reply_markup=_retry_cancel_kb(actor.role))
             return
         candidates = repo_users.find_students_by_email(email.lower())
         if not candidates:
             log.info("[reg] student not found by email=%s", email)
-            # keep state but allow retry/back
-            await m.answer(
-                "E_STUDENT_NOT_FOUND — Запись не найдена. Проверьте e-mail или свяжитесь с владельцем.",
-                reply_markup=_retry_cancel_kb(),
-            )
+            # keep state but allow retry/back; if email exists but bound, show dedicated message
+            if repo_users.is_student_email_bound(email.lower()):
+                await m.answer(
+                    "⛔ Ваш e‑mail уже привязан к другому Telegram аккаунту. Обратитесь к владельцу",
+                    reply_markup=_retry_cancel_kb(actor.role),
+                )
+            else:
+                await m.answer(
+                    "⛔ Запись не найдена. Проверьте e‑mail или обратитесь к владельцу",
+                    reply_markup=_retry_cancel_kb(actor.role),
+                )
             return
         if len(candidates) == 1:
             cand = candidates[0]
@@ -309,18 +274,22 @@ async def reg_input_text(m: types.Message, actor: Identity):
                 {"role": "s", "step": "confirm", "user_id": cand["id"]},
                 ttl_sec=900,
             )
-            desc = f"{cand.get('name') or 'Без имени'}" + (
-                f", группа {cand.get('group_name')}" if cand.get("group_name") else ""
-            )
+            name = cand.get("name") or "Без имени"
+            group = cand.get("group_name") or "—"
+            email = cand.get("email") or "—"
             await m.answer(
-                f"Профиль найден: {desc}\nПодтвердить привязку?",
+                "Найден профиль студента:\n"
+                f"👤 {name}\n"
+                f"🎓 Группа: {group}\n"
+                f"✉️ E‑mail: {email}\n\n"
+                "Подтвердить привязку?",
                 reply_markup=types.InlineKeyboardMarkup(
                     inline_keyboard=[
                         [
                             types.InlineKeyboardButton(
-                                text="Подтвердить",
+                                text="✅ Подтвердить",
                                 callback_data=callbacks.build(
-                                    "reg", {"action": "confirm_yes", "params": {}}
+                                    "reg_confirm_yes", {}, role=actor.role
                                 ),
                             )
                         ],
@@ -328,7 +297,7 @@ async def reg_input_text(m: types.Message, actor: Identity):
                             types.InlineKeyboardButton(
                                 text="⬅️ Назад",
                                 callback_data=callbacks.build(
-                                    "reg", {"action": "back", "params": {}}
+                                    "reg_back", {}, role=actor.role
                                 ),
                             )
                         ],
@@ -348,9 +317,9 @@ async def reg_input_text(m: types.Message, actor: Identity):
     # no active registration state — ignore
 
 
-@router.callback_query(_cb("reg", {"retry"}))
+@router.callback_query(_op("reg_retry"))
 async def reg_retry(cq: types.CallbackQuery, actor: Identity):
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     role = st.get("role")
@@ -370,22 +339,28 @@ async def reg_retry(cq: types.CallbackQuery, actor: Identity):
             {"role": "s", "step": "email", "attempts": 0},
             ttl_sec=900,
         )
-        await cq.message.answer("Введите e-mail, указанный в LMS:")
+        await cq.message.answer("✉️ Введите ваш e‑mail как в LMS (Moodle):")
     else:
         await cq.message.answer("Начните заново: /start")
     await cq.answer()
 
 
-@router.callback_query(_cb("reg", {"back"}))
+@router.callback_query(_op("reg_back"))
 async def reg_back(cq: types.CallbackQuery, actor: Identity):
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     role = st.get("role")
     if role:
         # go back to role selection
         state_store.put_at(_reg_key(uid), "reg", {"step": "choose"}, ttl_sec=900)
-    await cq.message.answer("Кем вы являетесь?", reply_markup=_start_keyboard())
+    await cq.message.answer(
+        "👋 Добро пожаловать в курс физики для будущих ML‑специалистов!\n"
+        "Этот бот поможет вам с учёбой: вы сможете получать материалы, сдавать работы и записываться на сдачи.\n"
+        "К сожалению, мы пока не знакомы.\n"
+        "Выберите роль для регистрации:",
+        reply_markup=_start_keyboard(actor.role),
+    )
     await cq.answer()
 
 
@@ -422,9 +397,7 @@ def _list_keyboard(
             [
                 types.InlineKeyboardButton(
                     text=txt,
-                    callback_data=callbacks.build(
-                        "reg", {"action": "pick", "params": {"uid": uid}}
-                    ),
+                    callback_data=callbacks.build("reg_pick", {"uid": uid}),
                 )
             ]
         )
@@ -433,18 +406,14 @@ def _list_keyboard(
         nav.append(
             types.InlineKeyboardButton(
                 text="« Назад",
-                callback_data=callbacks.build(
-                    "reg", {"action": "page", "params": {"page": page - 1}}
-                ),
+                callback_data=callbacks.build("reg_page", {"page": page - 1}),
             )
         )
     if page < total_pages - 1:
         nav.append(
             types.InlineKeyboardButton(
                 text="Вперёд »",
-                callback_data=callbacks.build(
-                    "reg", {"action": "page", "params": {"page": page + 1}}
-                ),
+                callback_data=callbacks.build("reg_page", {"page": page + 1}),
             )
         )
     if nav:
@@ -453,7 +422,7 @@ def _list_keyboard(
         [
             types.InlineKeyboardButton(
                 text="⬅️ Назад",
-                callback_data=callbacks.build("reg", {"action": "back", "params": {}}),
+                callback_data=callbacks.build("reg_back", {}),
             )
         ]
     )
@@ -472,12 +441,12 @@ async def _send_candidates_list(m: types.Message, role: str, page: int, ids: lis
     await m.answer(header, reply_markup=_list_keyboard(role, page, total_pages, ids))
 
 
-@router.callback_query(_cb("reg", {"page"}))
+@router.callback_query(_op("reg_page"))
 async def reg_page(cq: types.CallbackQuery, actor: Identity):
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
-    _, payload = callbacks.extract(cq.data)
-    page = int(payload["params"].get("page", 0))
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    page = int(payload.get("page", 0))
     ids = st.get("ids") or []
     role = st.get("role") or "s"
     if not ids:
@@ -498,37 +467,48 @@ async def reg_page(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(_cb("reg", {"pick"}))
+@router.callback_query(_op("reg_pick"))
 async def reg_pick(cq: types.CallbackQuery, actor: Identity):
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     role = st.get("role") or "s"
-    _, payload = callbacks.extract(cq.data)
-    user_id = payload["params"].get("uid")
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    user_id = payload.get("uid")
+    # Teacher flow: prevent picking already bound teacher
+    if role == "t" and user_id and repo_users.is_user_bound(user_id):
+        await cq.message.answer(
+            "⛔ Этот преподаватель уже зарегистрирован. Обратитесь к владельцу"
+        )
+        await cq.answer()
+        return
     state_store.put_at(
         _reg_key(uid),
         "reg",
         {"role": role, "step": "confirm", "user_id": user_id},
         ttl_sec=900,
     )
+    if role == "t":
+        info = repo_users.get_user_brief(user_id) if user_id else None
+        name = (info or {}).get("name") or "Без имени"
+        header = f"Вы уверены, что хотите зарегистрироваться как {name}?"
+    else:
+        header = "Профиль выбран. Подтвердить привязку?"
     await cq.message.answer(
-        "Профиль выбран. Подтвердить привязку?",
+        header,
         reply_markup=types.InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     types.InlineKeyboardButton(
-                        text="Подтвердить",
+                        text="✅ Подтвердить",
                         callback_data=callbacks.build(
-                            "reg", {"action": "confirm_yes", "params": {}}
+                            "reg_confirm_yes", {}, role=actor.role
                         ),
                     )
                 ],
                 [
                     types.InlineKeyboardButton(
                         text="⬅️ Назад",
-                        callback_data=callbacks.build(
-                            "reg", {"action": "back", "params": {}}
-                        ),
+                        callback_data=callbacks.build("reg_back", {}, role=actor.role),
                     )
                 ],
             ]
@@ -537,9 +517,9 @@ async def reg_pick(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.callback_query(_cb("reg", {"confirm_yes"}))
+@router.callback_query(_op("reg_confirm_yes"))
 async def reg_confirm(cq: types.CallbackQuery, actor: Identity):
-    callbacks.extract(cq.data)
+    callbacks.extract(cq.data, expected_role=actor.role)
     uid = _uid(cq)
     st = _safe_get(_reg_key(uid)) or {}
     user_id = st.get("user_id")
@@ -561,5 +541,5 @@ async def reg_confirm(cq: types.CallbackQuery, actor: Identity):
         return
     log.info("[reg] bound tg=%s to user_id=%s", eff, user_id)
     state_store.delete(_reg_key(uid))
-    await cq.message.answer("Готово! Вы привязаны к профилю. Открываю главное меню.")
+    await cq.message.answer("✅ Регистрация завершена")
     await cq.answer()

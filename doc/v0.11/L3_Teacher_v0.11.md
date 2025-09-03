@@ -29,7 +29,7 @@
 
 ---
 ## 4. Callback и StateStore
-- Все интеракции — через `"{op}:{uuid}"`.
+- Все интеракции — через `"{op}:{key}"` (где `key` — 12‑символьный hex из `uuid4().hex[:12]`).
 - Никаких JSON в callback_data; параметры — в `state_store.params`.
 - TTL 15 минут, после истечения — `E_STATE_EXPIRED`.
 

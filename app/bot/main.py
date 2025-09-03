@@ -8,6 +8,7 @@ from app.bot.commands_epic4_owner import router as epic4_owner_router
 from app.bot.commands_epic4_student import router as epic4_student_router
 from app.bot.commands_epic4_teacher import router as epic4_teacher_router
 from app.bot.commands_epic5_register import router as epic5_register_router
+from app.bot.commands_epic5_register_owner import router as epic5_register_owner_router
 from app.bot.demo_epic2 import router as demo_router
 from app.core.cleanup import periodic_cleanup
 from app.core.config import cfg
@@ -41,6 +42,7 @@ async def main():
 
     dp.include_router(epic3_router)
     # 🔽 EPIC-5: registration router
+    dp.include_router(epic5_register_owner_router)
     dp.include_router(epic5_register_router)
     # 🔽 EPIC-4: order matters — owner/teacher first, then student
     dp.include_router(epic4_owner_router)
