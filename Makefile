@@ -1,4 +1,4 @@
-.PHONY: init dev run-bot lint fmt test doctor dirs migrate seed clean-db
+.PHONY: init dev run-bot lint fmt test doctor dirs migrate seed clean-db fix-eol
 
 PY=poetry run
 DEV_DIRS=var var/materials var/submissions var/exports var/tmp var/logs
@@ -13,7 +13,7 @@ run-bot:
 	$(PY) python -m app.bot.main
 
 lint:
-	poetry run flake8 app
+	poetry run flake8 -j1 app
 
 fmt:
 	poetry run black app tests && poetry run isort app tests

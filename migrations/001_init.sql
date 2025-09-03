@@ -2,7 +2,12 @@ PRAGMA foreign_keys=ON;
 
 -- ========= USERS =========
 CREATE TABLE IF NOT EXISTS users (
-  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  id               TEXT PRIMARY KEY DEFAULT (
+                     lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) ||
+                     '-' || '4' || substr(hex(randomblob(2)),2) || '-' ||
+                     substr('89ab', abs(random()) % 4 + 1, 1) ||
+                     substr(hex(randomblob(2)),2) || '-' || hex(randomblob(6)))
+                   ),
   tg_id            TEXT UNIQUE,
   role             TEXT NOT NULL CHECK(role IN ('owner','teacher','student')),
   name             TEXT,
@@ -38,7 +43,7 @@ CREATE TABLE IF NOT EXISTS slots (
   duration_min     INTEGER NOT NULL,
   capacity         INTEGER NOT NULL,
   status           TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','closed','canceled')),
-  created_by       INTEGER NOT NULL,
+  created_by       TEXT NOT NULL,
   created_at_utc   INTEGER NOT NULL,
   FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE RESTRICT
 );
@@ -47,7 +52,7 @@ CREATE INDEX IF NOT EXISTS idx_slots_starts ON slots(starts_at_utc);
 CREATE TABLE IF NOT EXISTS slot_enrollments (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   slot_id          INTEGER NOT NULL,
-  user_id          INTEGER NOT NULL,
+  user_id          TEXT NOT NULL,
   status           TEXT NOT NULL DEFAULT 'booked' CHECK(status IN ('booked','canceled','attended','no_show')),
   booked_at_utc    INTEGER NOT NULL,
   UNIQUE(slot_id, user_id),
@@ -70,7 +75,7 @@ CREATE TABLE IF NOT EXISTS materials (
   -- видимость материала:
   visibility       TEXT NOT NULL DEFAULT 'public' CHECK(visibility IN ('public','teacher_only')),
   -- служебные поля:
-  uploaded_by      INTEGER NOT NULL,
+  uploaded_by      TEXT NOT NULL,
   created_at_utc   INTEGER NOT NULL,
   FOREIGN KEY (assignment_id) REFERENCES assignments(id) ON DELETE SET NULL,
   FOREIGN KEY (week_no)       REFERENCES weeks(week_no) ON UPDATE CASCADE ON DELETE SET NULL,
@@ -88,11 +93,11 @@ CREATE TABLE IF NOT EXISTS submissions (
   assignment_id    INTEGER,
   -- основная модель EPIC-4: сдача по неделе
   week_no          INTEGER,
-  student_id       INTEGER NOT NULL,
+  student_id       TEXT NOT NULL,
   status           TEXT NOT NULL DEFAULT 'submitted' CHECK(status IN ('submitted','graded')),
   grade            TEXT,                 -- заглушка на оценку (можно 'pass'/'fail' или число/буква)
   created_at_utc   INTEGER NOT NULL,
-  reviewed_by      INTEGER,
+  reviewed_by      TEXT,
   reviewed_at_utc  INTEGER,
   FOREIGN KEY (assignment_id) REFERENCES assignments(id) ON DELETE CASCADE,
   FOREIGN KEY (week_no)       REFERENCES weeks(week_no) ON UPDATE CASCADE ON DELETE SET NULL,
@@ -123,8 +128,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   ts_utc           INTEGER NOT NULL,
   request_id       TEXT,
-  actor_id         INTEGER,
-  as_user_id       INTEGER,
+  actor_id         TEXT,
+  as_user_id       TEXT,
   as_role          TEXT,
   event            TEXT NOT NULL,
   object_type      TEXT,

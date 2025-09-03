@@ -12,3 +12,7 @@ class StateExpired(StateError):
 
 class StateRoleMismatch(StateError):
     code = "E_STATE_ROLE_MISMATCH"
+
+
+class EmailAlreadyBound(Exception):
+    code = "E_EMAIL_ALREADY_BOUND"

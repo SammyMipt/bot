@@ -23,19 +23,17 @@ def _ensure_week(conn, week_no: int) -> None:
         )
 
 
-def _ensure_user(conn) -> int:
+def _ensure_user(conn) -> str:
     r = conn.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1").fetchone()
     if r:
-        return int(r[0])
+        return r[0]
     tg = "test_epic4_" + uuid.uuid4().hex[:8]
     conn.execute(
         "INSERT INTO users(tg_id, role, name, created_at_utc, updated_at_utc) "
         "VALUES(?, 'student', 'Test User', strftime('%s','now'), strftime('%s','now'))",
         (tg,),
     )
-    return int(
-        conn.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1").fetchone()[0]
-    )
+    return conn.execute("SELECT id FROM users WHERE tg_id=?", (tg,)).fetchone()[0]
 
 
 def test_materials_visibility_and_dedup(db_tmpdir):

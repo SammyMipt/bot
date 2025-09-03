@@ -3,7 +3,7 @@ from __future__ import annotations
 from aiogram import F, Router, types
 from aiogram.filters import Command
 
-from app.core import state_store
+from app.core import callbacks, state_store
 from app.core.auth import Identity
 from app.core.errors import StateNotFound
 from app.core.files import save_blob
@@ -20,6 +20,20 @@ from app.core.repos_epic4 import (
 router = Router(name="epic4.student")
 
 
+def _cb(op: str, actions: set[str]):
+    def _f(cq: types.CallbackQuery) -> bool:
+        try:
+            op2, key = callbacks.parse(cq.data)
+            if op2 != op:
+                return False
+            _, payload = state_store.get(key)
+            return payload.get("action") in actions
+        except Exception:
+            return False
+
+    return _f
+
+
 def _uid(msg_or_cq: types.Message | types.CallbackQuery) -> int:
     return (
         msg_or_cq.from_user.id
@@ -34,12 +48,15 @@ def _wk_key(uid: int) -> str:
 
 def _safe_get(key: str):
     try:
-        return state_store.get(key)
+        _, params = state_store.get(key)
+        return params
     except StateNotFound:
         return None
 
 
-def _weeks_keyboard(prefix: str, page: int = 0) -> types.InlineKeyboardMarkup:
+def _weeks_keyboard(
+    prefix: str, role: str, page: int = 0
+) -> types.InlineKeyboardMarkup:
     weeks = list_weeks(limit=200)
     per_page = 28
     row_size = 7
@@ -52,7 +69,12 @@ def _weeks_keyboard(prefix: str, page: int = 0) -> types.InlineKeyboardMarkup:
     row: list[types.InlineKeyboardButton] = []
     for n in chunk:
         row.append(
-            types.InlineKeyboardButton(text=f"W{n}", callback_data=f"{prefix}:week:{n}")
+            types.InlineKeyboardButton(
+                text=f"W{n}",
+                callback_data=callbacks.build(
+                    prefix, {"action": "week", "params": {"week": n}}, role=role
+                ),
+            )
         )
         if len(row) == row_size:
             rows.append(row)
@@ -65,13 +87,23 @@ def _weeks_keyboard(prefix: str, page: int = 0) -> types.InlineKeyboardMarkup:
         if page > 0:
             nav.append(
                 types.InlineKeyboardButton(
-                    text="« Назад", callback_data=f"{prefix}:page:{page - 1}"
+                    text="« Назад",
+                    callback_data=callbacks.build(
+                        prefix,
+                        {"action": "page", "params": {"page": page - 1}},
+                        role=role,
+                    ),
                 )
             )
         if page < total_pages - 1:
             nav.append(
                 types.InlineKeyboardButton(
-                    text="Вперёд »", callback_data=f"{prefix}:page:{page + 1}"
+                    text="Вперёд »",
+                    callback_data=callbacks.build(
+                        prefix,
+                        {"action": "page", "params": {"page": page + 1}},
+                        role=role,
+                    ),
                 )
             )
         if nav:
@@ -79,13 +111,16 @@ def _weeks_keyboard(prefix: str, page: int = 0) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _files_list_markup(files: list[dict]) -> types.InlineKeyboardMarkup:
+def _files_list_markup(files: list[dict], role: str) -> types.InlineKeyboardMarkup:
     rows: list[list[types.InlineKeyboardButton]] = []
     row: list[types.InlineKeyboardButton] = []
     for f in files:
         row.append(
             types.InlineKeyboardButton(
-                text=f"Удалить #{f['id']}", callback_data=f"subw:del:{f['id']}"
+                text=f"Удалить #{f['id']}",
+                callback_data=callbacks.build(
+                    "subw", {"action": "del", "params": {"id": f["id"]}}, role=role
+                ),
             )
         )
         if len(row) == 2:
@@ -96,21 +131,51 @@ def _files_list_markup(files: list[dict]) -> types.InlineKeyboardMarkup:
     # меню под списком
     rows.append(
         [
-            types.InlineKeyboardButton(text="Готово", callback_data="subw:done"),
-            types.InlineKeyboardButton(text="Отмена", callback_data="subw:cancel"),
-            types.InlineKeyboardButton(text="Мои файлы", callback_data="subw:list"),
+            types.InlineKeyboardButton(
+                text="Готово",
+                callback_data=callbacks.build(
+                    "subw", {"action": "done", "params": {}}, role=role
+                ),
+            ),
+            types.InlineKeyboardButton(
+                text="Отмена",
+                callback_data=callbacks.build(
+                    "subw", {"action": "cancel", "params": {}}, role=role
+                ),
+            ),
+            types.InlineKeyboardButton(
+                text="Мои файлы",
+                callback_data=callbacks.build(
+                    "subw", {"action": "list", "params": {}}, role=role
+                ),
+            ),
         ]
     )
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _submit_menu_markup() -> types.InlineKeyboardMarkup:
+def _submit_menu_markup(role: str) -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                types.InlineKeyboardButton(text="Готово", callback_data="subw:done"),
-                types.InlineKeyboardButton(text="Отмена", callback_data="subw:cancel"),
-                types.InlineKeyboardButton(text="Мои файлы", callback_data="subw:list"),
+                types.InlineKeyboardButton(
+                    text="Готово",
+                    callback_data=callbacks.build(
+                        "subw", {"action": "done", "params": {}}, role=role
+                    ),
+                ),
+                types.InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data=callbacks.build(
+                        "subw", {"action": "cancel", "params": {}}, role=role
+                    ),
+                ),
+                types.InlineKeyboardButton(
+                    text="Мои файлы",
+                    callback_data=callbacks.build(
+                        "subw", {"action": "list", "params": {}}, role=role
+                    ),
+                ),
             ]
         ]
     )
@@ -120,27 +185,33 @@ def _submit_menu_markup() -> types.InlineKeyboardMarkup:
 
 
 @router.message(Command("materials"))
-async def materials_start(m: types.Message):
-    await m.answer("Выберите неделю:", reply_markup=_weeks_keyboard("mat", page=0))
+async def materials_start(m: types.Message, actor: Identity):
+    await m.answer(
+        "Выберите неделю:",
+        reply_markup=_weeks_keyboard("mat", role=actor.role, page=0),
+    )
 
 
-@router.callback_query(F.data.regexp(r"^mat:page:(\d+)$"))
-async def materials_page(cq: types.CallbackQuery):
-    page = int(cq.data.split(":")[2])
+@router.callback_query(_cb("mat", {"page"}))
+async def materials_page(cq: types.CallbackQuery, actor: Identity):
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    page = int(payload["params"].get("page", 0))
     try:
         await cq.message.edit_reply_markup(
-            reply_markup=_weeks_keyboard("mat", page=page)
+            reply_markup=_weeks_keyboard("mat", role=actor.role, page=page)
         )
     except Exception:
         await cq.message.answer(
-            "Выберите неделю:", reply_markup=_weeks_keyboard("mat", page=page)
+            "Выберите неделю:",
+            reply_markup=_weeks_keyboard("mat", role=actor.role, page=page),
         )
     await cq.answer()
 
 
-@router.callback_query(F.data.regexp(r"^mat:week:(\d+)$"))
+@router.callback_query(_cb("mat", {"week"}))
 async def materials_week(cq: types.CallbackQuery, actor: Identity):
-    week_no = int(cq.data.split(":")[2])
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week_no = int(payload["params"].get("week", 0))
     audience = "teacher" if actor.role in ("owner", "teacher") else "student"
     mats = list_materials_by_week(week_no, audience=audience)
     if not mats:
@@ -153,20 +224,31 @@ async def materials_week(cq: types.CallbackQuery, actor: Identity):
         lines.append(f"• #{m.id} — {m.mime or 'file'} | size={m.size_bytes} | {short}")
     kb = types.InlineKeyboardMarkup(
         inline_keyboard=[
-            [types.InlineKeyboardButton(text="← К неделям", callback_data="mat:back")]
+            [
+                types.InlineKeyboardButton(
+                    text="← К неделям",
+                    callback_data=callbacks.build(
+                        "mat", {"action": "back", "params": {}}, role=actor.role
+                    ),
+                )
+            ]
         ]
     )
     await cq.message.answer("\n".join(lines[:50]), reply_markup=kb)
     await cq.answer()
 
 
-@router.callback_query(F.data == "mat:back")
-async def materials_back(cq: types.CallbackQuery):
+@router.callback_query(_cb("mat", {"back"}))
+async def materials_back(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data, expected_role=actor.role)
     try:
-        await cq.message.edit_reply_markup(reply_markup=_weeks_keyboard("mat", page=0))
+        await cq.message.edit_reply_markup(
+            reply_markup=_weeks_keyboard("mat", role=actor.role, page=0)
+        )
     except Exception:
         await cq.message.answer(
-            "Выберите неделю:", reply_markup=_weeks_keyboard("mat", page=0)
+            "Выберите неделю:",
+            reply_markup=_weeks_keyboard("mat", role=actor.role, page=0),
         )
     await cq.answer()
 
@@ -178,42 +260,49 @@ async def materials_back(cq: types.CallbackQuery):
 async def submit_week_start(m: types.Message, actor: Identity):
     if actor.role != "student":
         return await m.answer("Эта команда доступна только студентам.")
-    await m.answer("Выберите неделю:", reply_markup=_weeks_keyboard("subw", page=0))
+    await m.answer(
+        "Выберите неделю:",
+        reply_markup=_weeks_keyboard("subw", role=actor.role, page=0),
+    )
 
 
-@router.callback_query(F.data.regexp(r"^subw:page:(\d+)$"))
+@router.callback_query(_cb("subw", {"page"}))
 async def submit_week_page(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "student":
         return await cq.answer("Только для студентов", show_alert=True)
-    page = int(cq.data.split(":")[2])
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    page = int(payload["params"].get("page", 0))
     try:
         await cq.message.edit_reply_markup(
-            reply_markup=_weeks_keyboard("subw", page=page)
+            reply_markup=_weeks_keyboard("subw", role=actor.role, page=page)
         )
     except Exception:
         await cq.message.answer(
-            "Выберите неделю:", reply_markup=_weeks_keyboard("subw", page=page)
+            "Выберите неделю:",
+            reply_markup=_weeks_keyboard("subw", role=actor.role, page=page),
         )
     await cq.answer()
 
 
-@router.callback_query(F.data.regexp(r"^subw:week:(\d+)$"))
+@router.callback_query(_cb("subw", {"week"}))
 async def submit_week_pick(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "student":
         return await cq.answer(
             "Эта команда доступна только студентам.", show_alert=True
         )
-    week_no = int(cq.data.split(":")[2])
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week_no = int(payload["params"].get("week", 0))
     uid = _uid(cq)
     sub_id = get_or_create_week_submission(actor.id, week_no)
     state_store.put_at(
         _wk_key(uid),
+        "wk_submit",
         {"mode": "collecting", "week_no": week_no, "sub_id": sub_id},
         ttl_sec=900,
     )
     await cq.message.answer(
         f"Неделя {week_no}. Отправьте один или несколько документов. Когда закончите — «Готово».",
-        reply_markup=_submit_menu_markup(),
+        reply_markup=_submit_menu_markup(actor.role),
     )
     await cq.answer()
 
@@ -261,33 +350,37 @@ async def submit_receive_file(m: types.Message, actor: Identity):
         )
 
 
-@router.callback_query(F.data == "subw:list")
+@router.callback_query(_cb("subw", {"list"}))
 async def submit_list(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data, expected_role=actor.role)
     st = _safe_get(_wk_key(_uid(cq)))
     if not st or st.get("mode") != "collecting":
         await cq.message.answer("Сначала вызовите /submit_week и выберите неделю.")
         return await cq.answer()
     files = list_submission_files(actor.id, st["week_no"])
     if not files:
-        await cq.message.answer("Пока файлов нет.", reply_markup=_submit_menu_markup())
+        await cq.message.answer(
+            "Пока файлов нет.", reply_markup=_submit_menu_markup(actor.role)
+        )
         return await cq.answer()
     lines = [
         f"• #{f['id']} — size={f['size_bytes']} | {f.get('mime') or 'file'}"
         for f in files
     ]
     await cq.message.answer(
-        "\n".join(lines[:50]), reply_markup=_files_list_markup(files)
+        "\n".join(lines[:50]), reply_markup=_files_list_markup(files, actor.role)
     )
     await cq.answer()
 
 
-@router.callback_query(F.data.regexp(r"^subw:del:(\d+)$"))
+@router.callback_query(_cb("subw", {"del"}))
 async def submit_delete(cq: types.CallbackQuery, actor: Identity):
     st = _safe_get(_wk_key(_uid(cq)))
     if not st or st.get("mode") != "collecting":
         await cq.message.answer("Сначала вызовите /submit_week и выберите неделю.")
         return await cq.answer()
-    fid = int(cq.data.split(":")[2])
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    fid = int(payload["params"].get("id", 0))
     ok = soft_delete_submission_file(fid, actor.id)
     await cq.message.answer("✅ Удалил." if ok else "Не найден/не ваш.")
     # обновим список
@@ -298,13 +391,14 @@ async def submit_delete(cq: types.CallbackQuery, actor: Identity):
     ]
     await cq.message.answer(
         "\n".join(lines) if lines else "Пока файлов нет.",
-        reply_markup=_files_list_markup(files),
+        reply_markup=_files_list_markup(files, actor.role),
     )
     await cq.answer()
 
 
-@router.callback_query(F.data == "subw:done")
-async def submit_done(cq: types.CallbackQuery):
+@router.callback_query(_cb("subw", {"done"}))
+async def submit_done(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data, expected_role=actor.role)
     uid = _uid(cq)
     st = _safe_get(_wk_key(uid))
     if not st:
@@ -317,8 +411,9 @@ async def submit_done(cq: types.CallbackQuery):
     await cq.answer()
 
 
-@router.callback_query(F.data == "subw:cancel")
-async def submit_cancel(cq: types.CallbackQuery):
+@router.callback_query(_cb("subw", {"cancel"}))
+async def submit_cancel(cq: types.CallbackQuery, actor: Identity):
+    callbacks.extract(cq.data, expected_role=actor.role)
     uid = _uid(cq)
     state_store.delete(_wk_key(uid))
     await cq.message.answer("Ок, отменил. Ничего не сохранил.")

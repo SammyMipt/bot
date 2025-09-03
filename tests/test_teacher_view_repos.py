@@ -23,16 +23,14 @@ def _ensure_week(conn, week_no: int) -> None:
     )
 
 
-def _create_user(conn, name: str, role: str = "student") -> int:
+def _create_user(conn, name: str, role: str = "student") -> str:
     tg = f"tg_{name.lower()}_" + uuid.uuid4().hex[:6]
     conn.execute(
         "INSERT INTO users(tg_id, role, name, created_at_utc, updated_at_utc) "
         "VALUES(?, ?, ?, strftime('%s','now'), strftime('%s','now'))",
         (tg, role, name),
     )
-    return int(
-        conn.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1").fetchone()[0]
-    )
+    return conn.execute("SELECT id FROM users WHERE tg_id=?", (tg,)).fetchone()[0]
 
 
 @pytest.mark.usefixtures("db_tmpdir")

@@ -1,9 +1,12 @@
 import uuid
 
+import pytest
+
 from app.core import auth
 from app.db.conn import db
 
 
+@pytest.mark.usefixtures("db_tmpdir")
 def test_create_and_get_user():
     tg = f"test_tg_{uuid.uuid4().hex[:8]}"
     try:
