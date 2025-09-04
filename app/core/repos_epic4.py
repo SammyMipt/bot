@@ -13,7 +13,7 @@ from app.db.conn import db
 @dataclass
 class Material:
     id: int
-    assignment_id: Optional[int]
+    week_id: int
     path: str
     sha256: str
     size_bytes: int
@@ -38,27 +38,27 @@ def list_materials_by_week(week_no: int, audience: str = "student") -> List[Mate
         if audience == "teacher":
             rows = conn.execute(
                 """
-                SELECT m.id, m.assignment_id, m.path, m.sha256, m.size_bytes, m.mime,
-                       m.uploaded_by, m.created_at_utc, m.week_no, m.visibility
+                SELECT m.id, m.week_id, m.path, m.sha256, m.size_bytes, m.mime,
+                       m.uploaded_by, m.created_at_utc, w.week_no, m.visibility
                 FROM materials m
-                LEFT JOIN assignments a ON a.id = m.assignment_id
-                WHERE (m.week_no = ? OR (a.week_no = ?))
+                JOIN weeks w ON w.id = m.week_id
+                WHERE w.week_no = ?
                 ORDER BY m.id ASC
                 """,
-                (week_no, week_no),
+                (week_no,),
             ).fetchall()
         else:
             rows = conn.execute(
                 """
-                SELECT m.id, m.assignment_id, m.path, m.sha256, m.size_bytes, m.mime,
-                       m.uploaded_by, m.created_at_utc, m.week_no, m.visibility
+                SELECT m.id, m.week_id, m.path, m.sha256, m.size_bytes, m.mime,
+                       m.uploaded_by, m.created_at_utc, w.week_no, m.visibility
                 FROM materials m
-                LEFT JOIN assignments a ON a.id = m.assignment_id
-                WHERE (m.week_no = ? OR (a.week_no = ?))
+                JOIN weeks w ON w.id = m.week_id
+                WHERE w.week_no = ?
                   AND m.visibility = 'public'
                 ORDER BY m.id ASC
                 """,
-                (week_no, week_no),
+                (week_no,),
             ).fetchall()
     return [Material(*row) for row in rows]
 
@@ -74,16 +74,20 @@ def insert_week_material_file(
 ) -> int:
     assert visibility in ("public", "teacher_only")
     with db() as conn:
+        wk = conn.execute("SELECT id FROM weeks WHERE week_no=?", (week_no,)).fetchone()
+        if not wk:
+            raise ValueError("unknown week_no")
+        week_id = int(wk[0])
         try:
             cur = conn.execute(
                 """
                 INSERT INTO materials(
-                  week_no, assignment_id, path, sha256, size_bytes,
+                  week_id, path, sha256, size_bytes,
                   mime, visibility, uploaded_by, created_at_utc
                 )
-                VALUES(?, NULL, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+                VALUES(?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
                 """,
-                (week_no, path, sha256, size_bytes, mime, visibility, uploaded_by),
+                (week_id, path, sha256, size_bytes, mime, visibility, uploaded_by),
             )
             return cur.lastrowid
         except sqlite3.IntegrityError:
