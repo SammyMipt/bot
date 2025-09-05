@@ -1,8 +1,8 @@
 from typing import Any, Awaitable, Callable, Dict
 
-from aiogram import BaseMiddleware
 from aiogram.types import CallbackQuery, Message
 
+from aiogram import BaseMiddleware
 from app.core import auth
 from app.core.config import cfg
 

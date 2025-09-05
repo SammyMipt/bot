@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-from aiogram import F, Router, types
 from aiogram.filters import Command, CommandStart
 
+from aiogram import F, Router, types
 from app.core import callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
-from app.core.backup import backup_recent
+from app.core.backup import backup_recent, trigger_backup
 from app.core.course_init import apply_course_init, parse_weeks_csv
+from app.core.imports_epic5 import (
+    E_DUPLICATE_USER,
+    STUDENT_HEADERS,
+    TEACHER_HEADERS,
+    get_templates,
+    get_users_summary,
+    import_students_csv,
+    import_teachers_csv,
+)
 from app.db.conn import db
 
 router = Router(name="ui.owner.stub")
@@ -154,6 +163,51 @@ def _ci_key(uid: int) -> str:
     return f"own_ci:{uid}"
 
 
+def _people_imp_key(uid: int) -> str:
+    return f"own_imp:{uid}"
+
+
+def _people_imp_ck(uid: int, kind: str) -> str:
+    return f"own_imp_ck:{uid}:{kind}"
+
+
+def _csv_filter_excess_columns(
+    content: bytes, expected_headers: list[str]
+) -> tuple[bytes, int, bool]:
+    """
+    Returns (filtered_csv_bytes, dropped_rows_count, headers_ok).
+    - If headers don't match expected_headers, returns original content with 0 drops and headers_ok=False
+    - Otherwise, drops data rows that have more columns than expected, keeping rows with <= expected.
+    """
+    import csv
+    import io
+
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = content.decode("utf-8", errors="replace")
+    reader = csv.reader(io.StringIO(text))
+    try:
+        headers = next(reader)
+    except StopIteration:
+        return content, 0, False
+    if headers != expected_headers:
+        return content, 0, False
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(headers)
+    dropped = 0
+    for row in reader:
+        if len(row) > len(expected_headers):
+            dropped += 1
+            continue
+        # pad short rows to expected length
+        if len(row) < len(expected_headers):
+            row = row + [""] * (len(expected_headers) - len(row))
+        w.writerow(row)
+    return buf.getvalue().encode("utf-8"), dropped, True
+
+
 @router.message(Command("owner"))
 async def owner_menu_cmd(m: types.Message, actor: Identity):
     if actor.role != "owner":
@@ -255,6 +309,20 @@ async def ownui_back(cq: types.CallbackQuery, actor: Identity):
         return await ownui_reports(cq, actor)
     if screen == "imp":
         return await ownui_impersonation(cq, actor)
+    if screen == "people_search":
+        return await ownui_people_search_start(cq, actor)
+    if screen == "ps_teachers":
+        cq.data = cb("ps_t_list", {"p": params.get("page", 0)})
+        return await ownui_ps_t_list(cq, actor)
+    if screen == "ps_students_groups":
+        cq.data = cb("ps_s_groups", {"p": params.get("page", 0)})
+        return await ownui_ps_s_groups(cq, actor)
+    if screen == "ps_students_names":
+        cq.data = cb(
+            "ps_s_names",
+            {"g": params.get("g", ""), "p": params.get("page", 0)},
+        )
+        return await ownui_ps_s_names(cq, actor)
     return await ownui_home(cq, actor)
 
 
@@ -270,14 +338,9 @@ def _course_kb(disabled: bool) -> types.InlineKeyboardMarkup:
         text="Общие сведения",
         callback_data=cb("course_info"),
     )
-    weeks_btn = types.InlineKeyboardButton(
-        text="Загрузка недель (CSV)",
-        callback_data=cb("course_weeks_csv"),
-    )
     rows = [
         [init_btn],
         [info_btn],
-        [weeks_btn],
     ]
     rows.append(_nav_keyboard("course").inline_keyboard[0])
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
@@ -304,14 +367,114 @@ async def ownui_course(cq: types.CallbackQuery, actor: Identity):
     _stack_push(_uid(cq), "course", {})
 
 
-@router.callback_query(_is("own", {"course_info", "course_weeks_csv"}))
-async def ownui_course_stub(cq: types.CallbackQuery, actor: Identity):
+def _fmt_deadline_utc(ts: int | None) -> tuple[str, str]:
+    from datetime import datetime, timezone
+
+    if not ts:
+        # В спецификации для недель используется индикатор дедлайна (🟢/🔴).
+        # Для отсутствующего дедлайна — без индикатора.
+        return ("без дедлайна", "")
+    # Для общих сведений показываем только дату (без времени и зоны)
+    dlt = datetime.fromtimestamp(int(ts), timezone.utc).strftime("%Y-%m-%d")
+    indicator = "🟢" if ts >= _now() else "🔴"
+    return (f"<b>дедлайн {dlt}</b>", indicator)
+
+
+def _course_info_build(page: int = 0, per_page: int = 8) -> tuple[str, int, int]:
+    # Returns (text, page, total_pages)
+    with db() as conn:
+        # course name (optional table)
+        try:
+            row = conn.execute("SELECT name FROM course WHERE id=1").fetchone()
+            c_name = row[0] if row and row[0] else "(без названия)"
+        except Exception:
+            c_name = "(без названия)"
+        total = conn.execute("SELECT COUNT(1) FROM weeks").fetchone()[0]
+        total_pages = max(1, (total + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        offset = page * per_page
+        rows = conn.execute(
+            "SELECT week_no, COALESCE(topic, title), deadline_ts_utc FROM weeks ORDER BY week_no ASC LIMIT ? OFFSET ?",
+            (per_page, offset),
+        ).fetchall()
+    lines = [
+        "📘 <b>Общие сведения о курсе</b>",
+        f"<b>Название:</b> {c_name}",
+        "",
+        f"Структура курса (стр. {page + 1}/{total_pages})",
+    ]
+    for wno, topic, dl in rows:
+        tp = topic or ""
+        # В общих сведениях показываем фактический номер недели (без W-префикса)
+        tag = f"{int(wno)}"
+        dl_text, ind = _fmt_deadline_utc(dl)
+        lines.append(f"• <b>Неделя {tag}</b> — {tp} — {dl_text} {ind}")
+    if not rows:
+        lines.append("• (нет недель)")
+    return "\n".join(lines), page, total_pages
+
+
+def _course_info_kb(page: int, total_pages: int) -> types.InlineKeyboardMarkup:
+    nav: list[types.InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="« Назад",
+                callback_data=cb("course_info_page", {"page": page - 1}),
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="Вперёд »",
+                callback_data=cb("course_info_page", {"page": page + 1}),
+            )
+        )
+    rows: list[list[types.InlineKeyboardButton]] = []
+    if nav:
+        rows.append(nav)
+    rows.append(_nav_keyboard("course").inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is("own", {"course_info"}))
+async def ownui_course_info(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
+    # consume token
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
     banner = await _maybe_banner(_uid(cq))
-    await cq.message.answer(
-        banner + "⛔ Функция не реализована", reply_markup=_nav_keyboard("course")
-    )
+    text, page, total = _course_info_build(page=0)
+    try:
+        await cq.message.edit_text(
+            banner + text, reply_markup=_course_info_kb(page, total), parse_mode="HTML"
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + text, reply_markup=_course_info_kb(page, total)
+        )
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"course_info_page"}))
+async def ownui_course_info_page(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    p = int(payload.get("page", 0))
+    banner = await _maybe_banner(_uid(cq))
+    text, page, total = _course_info_build(page=p)
+    try:
+        await cq.message.edit_text(
+            banner + text, reply_markup=_course_info_kb(page, total), parse_mode="HTML"
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + text, reply_markup=_course_info_kb(page, total)
+        )
     await cq.answer()
 
 
@@ -435,13 +598,18 @@ async def ownui_course_init_receive_csv(m: types.Message, actor: Identity):
     content = b.read()
     parsed = parse_weeks_csv(content)
     if parsed.errors:
-        if any(
-            e.startswith("E_FORMAT_COLUMNS") or ":E_FORMAT_COLUMNS" in e
-            for e in parsed.errors
-        ):
+        # Заголовки/структура CSV (синхронизировано с реестром: E_IMPORT_FORMAT)
+        if any(e == "E_IMPORT_FORMAT" for e in parsed.errors):
             await m.answer("⛔ Ошибка формата CSV (лишние/неверные колонки)")
-        elif any(":E_DEADLINE_INVALID" in e for e in parsed.errors):
+        # Невалидный дедлайн (контентная ошибка формата импорта)
+        elif any(":E_IMPORT_FORMAT" in e and "deadline" in e for e in parsed.errors):
             await m.answer("⛔ Некорректная дата дедлайна")
+        elif any("E_WEEK_DUPLICATE" in e for e in parsed.errors):
+            await m.answer("⛔ Дубликаты идентификаторов недель (week_id)")
+        elif any("E_WEEK_SEQUENCE_GAP" in e for e in parsed.errors):
+            await m.answer(
+                "⛔ Последовательность week_id должна быть непрерывной начиная с 1"
+            )
         else:
             await m.answer("⛔ Ошибка CSV")
         state_store.put_at(
@@ -484,13 +652,20 @@ async def ownui_course_init_3(cq: types.CallbackQuery, actor: Identity):
             reply_markup=_nav_keyboard("course"),
         )
         return await cq.answer()
-    preview_lines = [
-        "Предпросмотр недель:",
-    ]
+    preview_lines = ["Предпросмотр недель:"]
     for r in rows[:10]:
         wn = r.get("week_no")
         tp = r.get("topic") or ""
-        preview_lines.append(f"– W{wn}: {tp}")
+        dl = r.get("deadline_ts_utc")
+        if dl:
+            from datetime import datetime, timezone
+
+            dlt = datetime.fromtimestamp(int(dl), timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC"
+            )
+            preview_lines.append(f"– W{wn}: {tp} — дедлайн {dlt}")
+        else:
+            preview_lines.append(f"– W{wn}: {tp}")
     if len(rows) > 10:
         preview_lines.append(f"… и ещё {len(rows) - 10}")
     await cq.message.answer(
@@ -533,6 +708,13 @@ async def ownui_course_init_done(cq: types.CallbackQuery, actor: Identity):
             reply_markup=_nav_keyboard("course"),
         )
         return await cq.answer()
+    # Enforce backup freshness per L3
+    if not backup_recent():
+        await cq.message.answer(
+            banner + "⛔ E_BACKUP_STALE — требуется свежий бэкап",
+            reply_markup=_nav_keyboard("course"),
+        )
+        return await cq.answer()
     # Apply
     try:
         parsed = [
@@ -564,11 +746,11 @@ def _people_kb(impersonating: bool = False) -> types.InlineKeyboardMarkup:
     rows = [
         [
             types.InlineKeyboardButton(
-                text="Импорт студентов (CSV)",
+                text=f"Импорт студентов (CSV){lock}",
                 callback_data=cb("people_imp_students"),
             ),
             types.InlineKeyboardButton(
-                text="Импорт преподавателей (CSV)",
+                text=f"Импорт преподавателей (CSV){lock}",
                 callback_data=cb("people_imp_teachers"),
             ),
         ],
@@ -607,9 +789,6 @@ async def ownui_people(cq: types.CallbackQuery, actor: Identity):
     _is(
         "own",
         {
-            "people_imp_students",
-            "people_imp_teachers",
-            "people_search",
             "people_matrix",
         },
     )
@@ -628,6 +807,702 @@ async def ownui_people_stubs(cq: types.CallbackQuery, actor: Identity):
         banner + "⛔ Функция не реализована", reply_markup=_nav_keyboard("people")
     )
     await cq.answer()
+
+
+# -------- People search --------
+
+
+def _ps_key(uid: int) -> str:
+    return f"own_ps:{uid}"
+
+
+@router.callback_query(_is("own", {"people_search"}))
+async def ownui_people_search_start(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="Преподаватели",
+                    callback_data=cb("ps_t_list", {"p": 0}),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="Студенты",
+                    callback_data=cb("ps_s_groups", {"p": 0}),
+                )
+            ],
+            _nav_keyboard("people").inline_keyboard[0],
+        ]
+    )
+    try:
+        await cq.message.edit_text(
+            banner + "Поиск профиля — выберите раздел:", reply_markup=kb
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + "Поиск профиля — выберите раздел:", reply_markup=kb
+        )
+    await cq.answer()
+
+
+def _awaits_ps_query(m: types.Message) -> bool:
+    try:
+        action, st = state_store.get(_ps_key(m.from_user.id))
+    except Exception:
+        return False
+    return action == "people_search" and (st or {}).get("mode") == "await_query"
+
+
+@router.message(F.text, _awaits_ps_query)
+async def ownui_people_search_query(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    q = (m.text or "").strip()
+    if not q:
+        return await m.answer("Введите хотя бы 1 символ")
+    uid = _uid(m)
+    # store last query (optional)
+    try:
+        state_store.put_at(
+            _ps_key(uid), "people_search", {"mode": "query_entered"}, ttl_sec=900
+        )
+    except Exception:
+        pass
+    like = q.lower() + "%"
+    rows: list[dict] = []
+    with db() as conn:
+        cur = conn.execute(
+            (
+                "SELECT id, role, name, COALESCE(email,''), COALESCE(group_name,''), tef, capacity, tg_id "
+                "FROM users WHERE LOWER(COALESCE(name,'')) LIKE ? OR LOWER(COALESCE(email,'')) LIKE ? "
+                "ORDER BY role, name LIMIT 20"
+            ),
+            (like, like),
+        )
+        for r in cur.fetchall():
+            rows.append(
+                {
+                    "id": str(r[0]),
+                    "role": r[1] or "",
+                    "name": r[2] or "",
+                    "email": r[3] or "",
+                    "group_name": r[4] or "",
+                    "tef": r[5],
+                    "capacity": r[6],
+                    "tg_id": r[7],
+                }
+            )
+    if not rows:
+        return await m.answer("Ничего не найдено", reply_markup=_nav_keyboard("people"))
+    kb_rows: list[list[types.InlineKeyboardButton]] = []
+    for r in rows:
+        extra = ""
+        if r["role"] == "student" and r["group_name"]:
+            extra = f" — {r['group_name']}"
+        if r["role"] == "teacher" and r["capacity"] is not None:
+            extra = f" — cap {r['capacity']}"
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=f"{r['name']} ({r['role']}){extra}",
+                    callback_data=cb("people_profile", {"uid": r["id"]}),
+                )
+            ]
+        )
+    kb_rows.append(_nav_keyboard("people").inline_keyboard[0])
+    await m.answer(
+        "Найдено по текстовому поиску:",
+        reply_markup=types.InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+
+
+@router.callback_query(_is("own", {"people_profile"}))
+async def ownui_people_profile(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    uid_param = str(payload.get("uid", ""))
+    if not uid_param:
+        return await cq.answer("Некорректный пользователь", show_alert=True)
+    row = None
+    with db() as conn:
+        row = conn.execute(
+            (
+                "SELECT id, role, name, email, group_name, tef, capacity, tg_id, is_active "
+                "FROM users WHERE id=? LIMIT 1"
+            ),
+            (uid_param,),
+        ).fetchone()
+    if not row:
+        return await cq.answer("Пользователь не найден", show_alert=True)
+    role = row[1] or ""
+    name = row[2] or "(без имени)"
+    email = row[3] or "—"
+    group_name = row[4] or ""
+    capacity = row[6]
+    tg_bound = bool(row[7])
+    active = int(row[8] or 0) == 1
+    role_emoji = (
+        "👑"
+        if role == "owner"
+        else ("👨‍🏫" if role == "teacher" else ("🎓" if role == "student" else "👤"))
+    )
+    status_emoji = "🟢" if active else "⚪️"
+    tg_emoji = "🟢" if tg_bound else "⚪️"
+    lines = [
+        f"<b>{name}</b>",
+        f"<b>Роль:</b> {role_emoji} {role}",
+        f"<b>Email:</b> {email}",
+        f"<b>Статус:</b> {status_emoji} {'активен' if active else 'неактивен'}",
+    ]
+    if role == "student":
+        lines.append(f"<b>Группа:</b> {group_name or '—'}")
+    if role == "teacher":
+        lines.append(
+            f"<b>Максимум студентов:</b> {capacity if capacity is not None else '—'}"
+        )
+    lines.append(f"<b>TG:</b> {tg_emoji} {'привязан' if tg_bound else 'не привязан'}")
+    banner = await _maybe_banner(_uid(cq))
+    toggle_txt = "Сделать неактивным" if active else "Сделать активным"
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text=toggle_txt,
+                    callback_data=cb("ps_toggle_active", {"uid": uid_param}),
+                )
+            ],
+            _nav_keyboard("people").inline_keyboard[0],
+        ]
+    )
+    try:
+        await cq.message.edit_text(
+            banner + "\n".join(lines), reply_markup=kb, parse_mode="HTML"
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + "\n".join(lines), reply_markup=kb, parse_mode="HTML"
+        )
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"ps_toggle_active"}))
+async def ownui_people_toggle_active(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    if _get_impersonation(_uid(cq)):
+        return await cq.answer("⛔ Недоступно в режиме имперсонизации", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    uid_param = str(payload.get("uid", ""))
+    if not uid_param:
+        return await cq.answer("Некорректный пользователь", show_alert=True)
+    with db() as conn:
+        row = conn.execute(
+            "SELECT role, name, email, group_name, tef, capacity, tg_id, is_active FROM users WHERE id=? LIMIT 1",
+            (uid_param,),
+        ).fetchone()
+        if not row:
+            return await cq.answer("Пользователь не найден", show_alert=True)
+        cur = int(row[7] or 0)
+        new_val = 0 if cur == 1 else 1
+        conn.execute(
+            "UPDATE users SET is_active=?, updated_at_utc=strftime('%s','now') WHERE id=?",
+            (new_val, uid_param),
+        )
+        conn.commit()
+        # Fetch updated row
+        row = conn.execute(
+            "SELECT role, name, email, group_name, tef, capacity, tg_id, is_active FROM users WHERE id=? LIMIT 1",
+            (uid_param,),
+        ).fetchone()
+    # Rebuild card (same format as ownui_people_profile)
+    role = row[0] or ""
+    name = row[1] or "(без имени)"
+    email = row[2] or "—"
+    group_name = row[3] or ""
+    capacity = row[5]
+    tg_bound = bool(row[6])
+    active = int(row[7] or 0) == 1
+    role_emoji = (
+        "👑"
+        if role == "owner"
+        else ("👨‍🏫" if role == "teacher" else ("🎓" if role == "student" else "👤"))
+    )
+    status_emoji = "🟢" if active else "⚪️"
+    tg_emoji = "🟢" if tg_bound else "⚪️"
+    lines = [
+        f"<b>{name}</b>",
+        f"<b>Роль:</b> {role_emoji} {role}",
+        f"<b>Email:</b> {email}",
+        f"<b>Статус:</b> {status_emoji} {'активен' if active else 'неактивен'}",
+    ]
+    if role == "student":
+        lines.append(f"<b>Группа:</b> {group_name or '—'}")
+    if role == "teacher":
+        lines.append(
+            f"<b>Максимум студентов:</b> {capacity if capacity is not None else '—'}"
+        )
+    lines.append(f"<b>TG:</b> {tg_emoji} {'привязан' if tg_bound else 'не привязан'}")
+    toggle_txt = "Сделать неактивным" if active else "Сделать активным"
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text=toggle_txt,
+                    callback_data=cb("ps_toggle_active", {"uid": uid_param}),
+                )
+            ],
+            _nav_keyboard("people").inline_keyboard[0],
+        ]
+    )
+    banner = await _maybe_banner(_uid(cq))
+    try:
+        await cq.message.edit_text(
+            banner + "\n".join(lines), reply_markup=kb, parse_mode="HTML"
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + "\n".join(lines), reply_markup=kb, parse_mode="HTML"
+        )
+    return await cq.answer()
+
+
+@router.callback_query(_is("own", {"ps_t_list"}))
+async def ownui_ps_t_list(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    page = int(payload.get("p", 0))
+    per_page = 10
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+    with db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(1) FROM users WHERE role='teacher'"
+        ).fetchone()[0]
+        total_pages = max(1, (int(total) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        offset = page * per_page
+        rows = conn.execute(
+            (
+                "SELECT id, name, capacity FROM users WHERE role='teacher' "
+                "ORDER BY COALESCE(name,'') ASC LIMIT ? OFFSET ?"
+            ),
+            (per_page, offset),
+        ).fetchall()
+    kb_rows: list[list[types.InlineKeyboardButton]] = []
+    for r in rows:
+        tid = str(r[0])
+        name = r[1] or "(без имени)"
+        cap = r[2]
+        cap_txt = f" — cap {cap}" if cap is not None else ""
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=f"{name}{cap_txt}",
+                    callback_data=cb("people_profile", {"uid": tid}),
+                )
+            ]
+        )
+    pager = []
+    if page > 0:
+        pager.append(
+            types.InlineKeyboardButton(
+                text="◀", callback_data=cb("ps_t_list", {"p": page - 1})
+            )
+        )
+    pager.append(
+        types.InlineKeyboardButton(
+            text=f"{page + 1}/{max(1, total_pages)}", callback_data=cb("noop")
+        )
+    )
+    if page < total_pages - 1:
+        pager.append(
+            types.InlineKeyboardButton(
+                text="▶", callback_data=cb("ps_t_list", {"p": page + 1})
+            )
+        )
+    kb_rows.append(pager)
+    kb_rows.append(_nav_keyboard("people").inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    try:
+        await cq.message.edit_text(banner + "Преподаватели:", reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + "Преподаватели:", reply_markup=kb)
+    _stack_push(uid, "ps_teachers", {"page": page})
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"ps_s_groups"}))
+async def ownui_ps_s_groups(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    page = int(payload.get("p", 0))
+    per_page = 10
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+    with db() as conn:
+        groups = [
+            r[0]
+            for r in conn.execute(
+                (
+                    "SELECT DISTINCT group_name FROM users WHERE role='student' AND COALESCE(group_name,'')<>'' "
+                    "ORDER BY group_name ASC"
+                )
+            ).fetchall()
+        ]
+    total = len(groups)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = groups[start : start + per_page]
+    kb_rows: list[list[types.InlineKeyboardButton]] = []
+    for g in chunk:
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=g,
+                    callback_data=cb("ps_s_names", {"g": g, "p": 0}),
+                )
+            ]
+        )
+    pager = []
+    if page > 0:
+        pager.append(
+            types.InlineKeyboardButton(
+                text="◀", callback_data=cb("ps_s_groups", {"p": page - 1})
+            )
+        )
+    pager.append(
+        types.InlineKeyboardButton(
+            text=f"{page + 1}/{max(1, total_pages)}", callback_data=cb("noop")
+        )
+    )
+    if page < total_pages - 1:
+        pager.append(
+            types.InlineKeyboardButton(
+                text="▶", callback_data=cb("ps_s_groups", {"p": page + 1})
+            )
+        )
+    kb_rows.append(pager)
+    kb_rows.append(_nav_keyboard("people").inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    try:
+        await cq.message.edit_text(banner + "Группы студентов:", reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + "Группы студентов:", reply_markup=kb)
+    _stack_push(uid, "ps_students_groups", {"page": page})
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"ps_s_names"}))
+async def ownui_ps_s_names(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    group = payload.get("g") or ""
+    page = int(payload.get("p", 0))
+    per_page = 10
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+    with db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(1) FROM users WHERE role='student' AND COALESCE(group_name,'')=?",
+            (group,),
+        ).fetchone()[0]
+        total_pages = max(1, (int(total) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        offset = page * per_page
+        rows = conn.execute(
+            (
+                "SELECT id, name FROM users WHERE role='student' AND COALESCE(group_name,'')=? "
+                "ORDER BY COALESCE(name,'') ASC LIMIT ? OFFSET ?"
+            ),
+            (group, per_page, offset),
+        ).fetchall()
+    kb_rows: list[list[types.InlineKeyboardButton]] = []
+    for r in rows:
+        sid = str(r[0])
+        name = r[1] or "(без имени)"
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=name,
+                    callback_data=cb("people_profile", {"uid": sid}),
+                )
+            ]
+        )
+    pager = []
+    if page > 0:
+        pager.append(
+            types.InlineKeyboardButton(
+                text="◀", callback_data=cb("ps_s_names", {"g": group, "p": page - 1})
+            )
+        )
+    pager.append(
+        types.InlineKeyboardButton(
+            text=f"{page + 1}/{max(1, total_pages)}", callback_data=cb("noop")
+        )
+    )
+    if page < total_pages - 1:
+        pager.append(
+            types.InlineKeyboardButton(
+                text="▶", callback_data=cb("ps_s_names", {"g": group, "p": page + 1})
+            )
+        )
+    kb_rows.append(pager)
+    kb_rows.append(_nav_keyboard("people").inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    header = f"Студенты группы {group}:"
+    try:
+        await cq.message.edit_text(banner + header, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + header, reply_markup=kb)
+    _stack_push(uid, "ps_students_names", {"g": group, "page": page})
+    await cq.answer()
+
+
+# Import: People (students/teachers)
+
+
+def _awaits_imp(m: types.Message, kind: str) -> bool:
+    try:
+        action, st = state_store.get(_people_imp_key(m.from_user.id))
+    except Exception:
+        return False
+    return action == kind and (st or {}).get("mode") == "await_csv"
+
+
+@router.callback_query(_is("own", {"people_imp_students"}))
+async def ownui_people_imp_students(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    if _get_impersonation(_uid(cq)):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+    state_store.put_at(
+        _people_imp_key(uid), "imp_students", {"mode": "await_csv"}, ttl_sec=1800
+    )
+    text = (
+        "Импорт студентов — загрузите файл students.csv.\n"
+        "Формат: surname,name,patronymic,email,group_name"
+    )
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="Скачать шаблон",
+                    callback_data=cb("people_tpl", {"t": "students"}),
+                )
+            ],
+            _nav_keyboard("people").inline_keyboard[0],
+        ]
+    )
+    try:
+        await cq.message.edit_text(banner + text, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + text, reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"people_imp_teachers"}))
+async def ownui_people_imp_teachers(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    if _get_impersonation(_uid(cq)):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+    state_store.put_at(
+        _people_imp_key(uid), "imp_teachers", {"mode": "await_csv"}, ttl_sec=1800
+    )
+    text = (
+        "Импорт преподавателей — загрузите файл teachers.csv.\n"
+        "Формат: surname,name,patronymic,email,tef,capacity"
+    )
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="Скачать шаблон",
+                    callback_data=cb("people_tpl", {"t": "teachers"}),
+                )
+            ],
+            _nav_keyboard("people").inline_keyboard[0],
+        ]
+    )
+    try:
+        await cq.message.edit_text(banner + text, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + text, reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"people_tpl"}))
+async def ownui_people_tpl(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    t = (payload.get("t") or "").lower()
+    tpls = get_templates()
+    name = "teachers.csv" if t == "teachers" else "students.csv"
+    data = tpls.get(name)
+    if not data:
+        return await cq.answer("Шаблон недоступен", show_alert=True)
+    await cq.message.answer_document(
+        types.BufferedInputFile(data, filename=name),
+        caption="Шаблон CSV",
+    )
+    await cq.answer()
+
+
+@router.message(F.document, lambda m: _awaits_imp(m, "imp_students"))
+async def ownui_people_imp_students_receive(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    uid = _uid(m)
+    doc = m.document
+    file = await m.bot.get_file(doc.file_id)
+    b = await m.bot.download_file(file.file_path)
+    content = b.read()
+    # Deduplicate by checksum per kind (do before state checks to show edge toast)
+    import hashlib
+
+    ck = hashlib.sha256(content).hexdigest()
+    try:
+        prev_ck_action, prev_ck = state_store.get(_people_imp_ck(uid, "students"))
+    except Exception:
+        prev_ck_action, prev_ck = None, None
+    if prev_ck_action == "ck" and prev_ck == ck:
+        await m.answer("⚠️ Импорт дублируется по checksum — пропущено")
+        return
+    state_store.put_at(_people_imp_ck(uid, "students"), "ck", ck, ttl_sec=3600)
+    # Ensure we are in the awaited state
+    try:
+        st_action, st = state_store.get(_people_imp_key(uid))
+    except Exception:
+        return
+    if st_action != "imp_students" or st.get("mode") != "await_csv":
+        return
+
+    # Filter rows with extra columns and warn
+    filtered, dropped, headers_ok = _csv_filter_excess_columns(content, STUDENT_HEADERS)
+    if headers_ok and dropped > 0:
+        await m.answer(f"⚠️ Лишние колонки CSV — строки проигнорированы: {dropped}")
+    content = filtered
+    res = import_students_csv(content)
+    total = res.created + res.updated
+    summary = f"Импорт завершён: {total} строк, ошибок {len(res.errors)}"
+    await m.answer(summary)
+    # Created/Updated breakdown
+    await m.answer(f"Создано: {res.created}, обновлено: {res.updated}")
+    # Duplicate rows in CSV
+    dups = sum(1 for e in res.errors if len(e) >= 3 and e[2] == E_DUPLICATE_USER)
+    if dups:
+        await m.answer(f"⚠️ Дубликаты в файле: {dups} — строки пропущены")
+    # Users summary
+    us = get_users_summary()
+    us_text = (
+        f"Учителя: всего {us.get('teachers_total', 0)}, без TG {us.get('teachers_no_tg', 0)}\n"
+        f"Студенты: всего {us.get('students_total', 0)}, без TG {us.get('students_no_tg', 0)}"
+    )
+    await m.answer(us_text, reply_markup=_nav_keyboard("people"))
+    if res.errors:
+        err_csv = res.to_error_csv()
+        await m.answer_document(
+            types.BufferedInputFile(err_csv, filename="students_import_errors.csv"),
+            caption="Ошибки импорта",
+        )
+    try:
+        state_store.delete(_people_imp_key(uid))
+    except Exception:
+        pass
+
+
+@router.message(F.document, lambda m: _awaits_imp(m, "imp_teachers"))
+async def ownui_people_imp_teachers_receive(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    uid = _uid(m)
+    doc = m.document
+    file = await m.bot.get_file(doc.file_id)
+    b = await m.bot.download_file(file.file_path)
+    content = b.read()
+    # Deduplicate by checksum per kind (do before state checks to show edge toast)
+    import hashlib
+
+    ck = hashlib.sha256(content).hexdigest()
+    try:
+        prev_ck_action, prev_ck = state_store.get(_people_imp_ck(uid, "teachers"))
+    except Exception:
+        prev_ck_action, prev_ck = None, None
+    if prev_ck_action == "ck" and prev_ck == ck:
+        await m.answer("⚠️ Импорт дублируется по checksum — пропущено")
+        return
+    state_store.put_at(_people_imp_ck(uid, "teachers"), "ck", ck, ttl_sec=3600)
+    # Ensure we are in the awaited state
+    try:
+        st_action, st = state_store.get(_people_imp_key(uid))
+    except Exception:
+        return
+    if st_action != "imp_teachers" or st.get("mode") != "await_csv":
+        return
+
+    # Filter rows with extra columns and warn
+    filtered, dropped, headers_ok = _csv_filter_excess_columns(content, TEACHER_HEADERS)
+    if headers_ok and dropped > 0:
+        await m.answer(f"⚠️ Лишние колонки CSV — строки проигнорированы: {dropped}")
+    content = filtered
+    res = import_teachers_csv(content)
+    total = res.created + res.updated
+    summary = f"Импорт завершён: {total} строк, ошибок {len(res.errors)}"
+    await m.answer(summary)
+    # Created/Updated breakdown
+    await m.answer(f"Создано: {res.created}, обновлено: {res.updated}")
+    # Duplicate rows in CSV
+    dups = sum(1 for e in res.errors if len(e) >= 3 and e[2] == E_DUPLICATE_USER)
+    if dups:
+        await m.answer(f"⚠️ Дубликаты в файле: {dups} — строки пропущены")
+    # Users summary
+    us = get_users_summary()
+    us_text = (
+        f"Учителя: всего {us.get('teachers_total', 0)}, без TG {us.get('teachers_no_tg', 0)}\n"
+        f"Студенты: всего {us.get('students_total', 0)}, без TG {us.get('students_no_tg', 0)}"
+    )
+    await m.answer(us_text, reply_markup=_nav_keyboard("people"))
+    if res.errors:
+        err_csv = res.to_error_csv()
+        await m.answer_document(
+            types.BufferedInputFile(err_csv, filename="teachers_import_errors.csv"),
+            caption="Ошибки импорта",
+        )
+    try:
+        state_store.delete(_people_imp_key(uid))
+    except Exception:
+        pass
 
 
 # -------- Materials --------
@@ -1085,9 +1960,12 @@ async def ownui_report_backup(cq: types.CallbackQuery, actor: Identity):
         return await cq.answer(
             "⛔ Бэкап недоступен в режиме имперсонизации", show_alert=True
         )
-    if not backup_recent():
-        return await cq.answer("⛔ Недоступно: нет свежего бэкапа", show_alert=True)
-    await cq.answer("✅ Бэкап запущен", show_alert=True)
+    # Запускаем авто-бэкап (full если требуется, иначе incremental)
+    try:
+        trigger_backup("auto")
+        await cq.answer("✅ Бэкап запущен", show_alert=True)
+    except Exception as e:
+        await cq.answer(f"⛔ Не удалось выполнить бэкап: {e}", show_alert=True)
 
 
 # -------- Impersonation --------

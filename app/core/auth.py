@@ -1,7 +1,14 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from aiogram.types import User as TgUser
+if TYPE_CHECKING:
+    from aiogram.types import User as TgUser  # type: ignore
+else:
+
+    class TgUser:  # minimal stub for tests without aiogram
+        id: int
+        full_name: str | None
+
 
 from app.core.roles import ALL_ROLES, STUDENT
 from app.db.conn import db
