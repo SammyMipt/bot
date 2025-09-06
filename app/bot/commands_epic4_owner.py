@@ -267,6 +267,8 @@ async def amw_receive_file(m: types.Message, actor: Identity):
         size_bytes=saved.size_bytes,
         mime=doc.mime_type,
         visibility=st["visibility"],
+        type="p",
+        original_name=doc.file_name or None,
     )
     # продлеваем TTL после действия
     state_store.put_at(_amw_key(uid), "amw", st, ttl_sec=900)

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
+
 from aiogram.filters import Command, CommandStart
 
 from aiogram import F, Router, types
 from app.core import audit, callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
 from app.core.backup import backup_recent, trigger_backup
+from app.core.config import cfg
 from app.core.course_init import apply_course_init, parse_weeks_csv
+from app.core.files import save_blob
 from app.core.imports_epic5 import (
     E_DUPLICATE_USER,
     STUDENT_HEADERS,
@@ -15,6 +19,15 @@ from app.core.imports_epic5 import (
     get_users_summary,
     import_students_csv,
     import_teachers_csv,
+)
+from app.core.repos_epic4 import (
+    archive_active,
+    delete_archived,
+    enforce_archive_limit,
+    get_active_material,
+    insert_week_material_file,
+    list_material_versions,
+    list_weeks,
 )
 from app.db.conn import db
 
@@ -1534,16 +1547,16 @@ async def ownui_people_imp_teachers_receive(m: types.Message, actor: Identity):
 
 
 def _materials_weeks_kb(page: int = 0) -> types.InlineKeyboardMarkup:
-    # 28 per page, 7 columns
+    # 28 per page, 7 columns; read weeks from DB
+    weeks = list_weeks(limit=200)
     per_page = 28
-    total = 56  # stubbed count of weeks
-    total_pages = max(1, (total + per_page - 1) // per_page)
+    total_pages = max(1, (len(weeks) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
-    start = page * per_page + 1
-    end = min(total, start + per_page - 1)
+    start = page * per_page
+    chunk = weeks[start : start + per_page]
     rows: list[list[types.InlineKeyboardButton]] = []
     row: list[types.InlineKeyboardButton] = []
-    for n in range(start, end + 1):
+    for n in chunk:
         row.append(
             types.InlineKeyboardButton(
                 text=f"W{n}",
@@ -1663,6 +1676,54 @@ async def ownui_materials_week(cq: types.CallbackQuery, actor: Identity):
     _stack_push(_uid(cq), "materials_week", {"week": week})
 
 
+# --- Materials: helpers/state ---
+
+try:
+    from aiogram.types import BufferedInputFile  # aiogram v3
+except Exception:  # pragma: no cover
+    BufferedInputFile = None  # type: ignore
+
+
+def _mat_key(uid: int) -> str:
+    return f"own_mat:{uid}"
+
+
+def _week_id_by_no(week_no: int) -> int | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM weeks WHERE week_no=?", (week_no,)
+        ).fetchone()
+        return int(row[0]) if row else None
+
+
+def _visibility_for_type(t: str) -> str:
+    # By convention: methodical ('m') is teacher-only, others public
+    return "teacher_only" if t == "m" else "public"
+
+
+def _mat_type_label(t: str) -> tuple[str, str]:
+    mapping = {
+        "p": ("📖", "Домашние задачи и материалы для подготовки"),
+        "m": ("📘", "Методические рекомендации"),
+        "n": ("📝", "Конспект"),
+        "s": ("📊", "Презентация"),
+        "v": ("🎥", "Записи лекций"),
+    }
+    return mapping.get(t, ("📄", "Материал"))
+
+
+def _fmt_bytes(n: int | None) -> str:
+    if not n:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    s = float(n)
+    i = 0
+    while s >= 1024 and i < len(units) - 1:
+        s /= 1024.0
+        i += 1
+    return f"{s:.1f} {units[i]}"
+
+
 def _material_card_kb(
     week: int, t: str, impersonating: bool
 ) -> types.InlineKeyboardMarkup:
@@ -1707,30 +1768,288 @@ async def ownui_material_type(cq: types.CallbackQuery, actor: Identity):
     t = payload.get("t", "?")
     imp = _get_impersonation(_uid(cq))
     banner = await _maybe_banner(_uid(cq))
+    # Card header with human-friendly info
+    emoji, label = _mat_type_label(t)
+    wk_id = _week_id_by_no(week)
+    active_line = "<i>Активной версии нет</i>"
+    if wk_id is not None:
+        mat = get_active_material(wk_id, t)
+        if mat:
+            fname = os.path.basename(mat.path or "") or "—"
+            size = _fmt_bytes(int(mat.size_bytes or 0))
+            active_line = f"<b>Активная:</b> {fname} · v{mat.version} · {size}"
+    header = f"<b>{emoji} {label}</b>\n" f"<b>Неделя:</b> W{week}\n" f"{active_line}"
     await cq.message.answer(
-        banner + "Карточка материала:",
+        banner + header,
         reply_markup=_material_card_kb(week, t, impersonating=bool(imp)),
+        parse_mode="HTML",
     )
     await cq.answer()
 
 
-@router.callback_query(
-    _is(
-        "own",
-        {"mat_upload", "mat_download", "mat_history", "mat_archive", "mat_delete"},
-    )
-)
-async def ownui_material_card_stubs(cq: types.CallbackQuery, actor: Identity):
+@router.callback_query(_is("own", {"mat_upload"}))
+async def ownui_mat_upload(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
-    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
-    act = payload.get("action")
     imp = _get_impersonation(_uid(cq))
-    if imp and act in {"mat_upload", "mat_archive", "mat_delete"}:
+    if imp:
         return await cq.answer(
             "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
         )
-    await cq.answer("⛔ Функция не реализована", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    if t == "v":
+        # Video material is a link upload (cloud/YouTube). Put a stub for now.
+        return await cq.answer("Загрузка ссылок на видео — заглушка", show_alert=True)
+    # set state to await document
+    state_store.put_at(
+        _mat_key(_uid(cq)),
+        "own_mat",
+        {"mode": "await_doc", "w": week, "t": t},
+        ttl_sec=900,
+    )
+    banner = await _maybe_banner(_uid(cq))
+    await cq.message.answer(banner + "Отправьте документ для загрузки (один файл)")
+    await cq.answer()
+
+
+def _awaits_mat_doc(m: types.Message) -> bool:
+    try:
+        act, st = state_store.get(_mat_key(m.from_user.id))
+        return act == "own_mat" and (st or {}).get("mode") == "await_doc"
+    except Exception:
+        return False
+
+
+@router.message(F.document, _awaits_mat_doc)
+async def ownui_mat_receive_doc(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    # get state
+    try:
+        _, st = state_store.get(_mat_key(_uid(m)))
+    except Exception:
+        return
+    week = int(st.get("w", 0))
+    t = str(st.get("t", "p"))
+    doc = m.document
+    # Validate size limit before download
+    try:
+        fsz = int(getattr(doc, "file_size", 0) or 0)
+    except Exception:
+        fsz = 0
+    limit_bytes = int(cfg.max_file_mb) * 1024 * 1024
+    if fsz and fsz > limit_bytes:
+        return await m.answer(
+            f"⛔ E_SIZE_LIMIT — Превышен лимит: ≤{cfg.max_file_mb} МБ"
+        )
+    # Validate extension/mime by type
+    fname = (doc.file_name or "").lower()
+    ext = "." + fname.split(".")[-1] if "." in fname else ""
+    allowed_by_type = {
+        "p": {".pdf"},
+        "m": {".pdf"},
+        "n": {".pdf"},
+        "s": {".pdf", ".ppt", ".pptx"},
+    }
+    if t != "v":
+        allowed = allowed_by_type.get(t, {".pdf"})
+        if ext not in allowed:
+            return await m.answer(
+                "⛔ E_INPUT_INVALID — Недопустимый тип файла для материала"
+            )
+    # Proceed to download
+    file = await m.bot.get_file(doc.file_id)
+    b = await m.bot.download_file(file.file_path)
+    data = b.read()
+    saved = save_blob(
+        data, prefix="materials", suggested_name=doc.file_name or "material.bin"
+    )
+    vis = _visibility_for_type(t)
+    mid = insert_week_material_file(
+        week_no=week,
+        uploaded_by=actor.id,
+        path=saved.path,
+        sha256=saved.sha256,
+        size_bytes=saved.size_bytes,
+        mime=doc.mime_type,
+        visibility=vis,
+        type=t,
+        original_name=doc.file_name or None,
+    )
+    if mid == -1:
+        await m.answer(
+            "⚠️ Файл идентичен активной версии или уже существует — загрузка пропущена"
+        )
+        return
+    # Enforce archive limit after backup if needed
+    wk_id = _week_id_by_no(week)
+    if wk_id is not None:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(1) FROM materials WHERE week_id=? AND type=?",
+                (wk_id, t),
+            ).fetchone()
+            total = int(row[0] or 0)
+        if total > 20:
+            try:
+                trigger_backup("auto")
+            except Exception:
+                pass
+            removed = enforce_archive_limit(wk_id, t, max_versions=20)
+            if removed > 0:
+                await m.answer(f"⚠️ Удалены старые архивные версии: {removed}")
+    # Audit and notify
+    try:
+        wk_id = _week_id_by_no(week)
+        mat = get_active_material(wk_id, t) if wk_id is not None else None
+        audit.log(
+            "OWNER_MATERIAL_UPLOAD",
+            actor.id,
+            meta={
+                "week": week,
+                "type": t,
+                "size_bytes": int(saved.size_bytes),
+                "sha256": saved.sha256,
+                "version": int(getattr(mat, "version", 0) or 0),
+            },
+        )
+    except Exception:
+        pass
+    await m.answer("✅ Загрузка завершена")
+    # keep state for possible next upload or clear? clear state
+    state_store.delete(_mat_key(_uid(m)))
+
+
+@router.callback_query(_is("own", {"mat_download"}))
+async def ownui_mat_download(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    mat = get_active_material(wk_id, t)
+    if not mat or not BufferedInputFile:
+        return await cq.answer("Нет активной версии", show_alert=True)
+    try:
+        with open(mat.path, "rb") as f:
+            data = f.read()
+        await cq.message.answer_document(
+            BufferedInputFile(
+                data, filename=(mat.path.split("/")[-1] or f"W{week}_{t}.bin")
+            ),
+            caption=f"W{week} {t}: активная версия v{mat.version}",
+        )
+        try:
+            audit.log(
+                "OWNER_MATERIAL_DOWNLOAD",
+                actor.id,
+                meta={"week": week, "type": t, "version": int(mat.version or 0)},
+            )
+        except Exception:
+            pass
+    except Exception:
+        return await cq.answer("Не удалось подготовить файл", show_alert=True)
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"mat_history"}))
+async def ownui_mat_history(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    items = list_material_versions(wk_id, t, limit=20)
+    emoji, label = _mat_type_label(t)
+    lines = [f"<b>{emoji} История — {label}</b>", f"<b>Неделя:</b> W{week}"]
+    for it in items:
+        status = "активна" if int(it.is_active or 0) == 1 else "архив"
+        fname = os.path.basename(it.path or "") or "—"
+        size = _fmt_bytes(int(it.size_bytes or 0))
+        lines.append(f"• v{it.version} — {status} — {fname} — {size}")
+    if len(lines) == 1:
+        lines.append("• (версий нет)")
+    banner = await _maybe_banner(_uid(cq))
+    await cq.message.answer(banner + "\n".join(lines), parse_mode="HTML")
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"mat_archive"}))
+async def ownui_mat_archive(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    imp = _get_impersonation(_uid(cq))
+    if imp:
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    # audit which version is being archived
+    prev = get_active_material(wk_id, t)
+    changed = archive_active(wk_id, t)
+    await cq.answer()
+    if changed:
+        await cq.message.answer("✅ Активная версия отправлена в архив")
+        try:
+            audit.log(
+                "OWNER_MATERIAL_ARCHIVE",
+                actor.id,
+                meta={
+                    "week": week,
+                    "type": t,
+                    "version": int(getattr(prev, "version", 0) or 0),
+                },
+            )
+        except Exception:
+            pass
+    else:
+        await cq.message.answer("Нет активной версии")
+
+
+@router.callback_query(_is("own", {"mat_delete"}))
+async def ownui_mat_delete(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    imp = _get_impersonation(_uid(cq))
+    if imp:
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    # backup then delete all archived for this type
+    try:
+        trigger_backup("auto")
+    except Exception:
+        pass
+    deleted = delete_archived(wk_id, t)
+    await cq.message.answer(f"Удалено архивных версий: {deleted}")
+    try:
+        audit.log(
+            "OWNER_MATERIAL_DELETE_ARCHIVED",
+            actor.id,
+            meta={"week": week, "type": t, "deleted": int(deleted)},
+        )
+    except Exception:
+        pass
+    await cq.answer()
 
 
 # -------- Archive --------
@@ -1800,11 +2119,89 @@ async def ownui_arch_materials_versions(cq: types.CallbackQuery, actor: Identity
     ]
     banner = await _maybe_banner(_uid(cq))
     await cq.message.answer(
-        banner + f"Архив W{week}: версии (заглушка)",
+        banner + f"Архив W{week}: версии",
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await cq.answer()
     _stack_push(_uid(cq), "arch_materials_versions", {"week": week})
+
+
+@router.callback_query(_is("own", {"arch_download_all"}))
+async def ownui_arch_download_all(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("week", 0))
+    wk_id = _week_id_by_no(week)
+    if wk_id is None or BufferedInputFile is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    # Collect archived files for the week (all types)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT path, type, version FROM materials WHERE week_id=? AND is_active=0 ORDER BY type ASC, version DESC",
+            (wk_id,),
+        ).fetchall()
+    if not rows:
+        return await cq.answer("Архив пуст", show_alert=True)
+    import io
+    import os
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for path, t, ver in rows:
+            try:
+                name = os.path.basename(path) or f"W{week}_{t}_v{ver}.bin"
+                arcname = f"W{week}/{t}/v{ver}/{name}"
+                tar.add(path, arcname=arcname)
+            except Exception:
+                continue
+    buf.seek(0)
+    await cq.message.answer_document(
+        BufferedInputFile(buf.read(), filename=f"W{week}_materials_archive.tar.gz"),
+        caption=f"Архив W{week}: {len(rows)} файлов",
+    )
+    try:
+        audit.log(
+            "OWNER_MATERIAL_ARCHIVE_DOWNLOAD_ALL",
+            actor.id,
+            meta={"week": week, "files": len(rows)},
+        )
+    except Exception:
+        pass
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"arch_delete_all"}))
+async def ownui_arch_delete_all(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    imp = _get_impersonation(_uid(cq))
+    if imp:
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("week", 0))
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    # Backup then delete all archived across types for this week
+    try:
+        trigger_backup("auto")
+    except Exception:
+        pass
+    deleted = delete_archived(wk_id, None)
+    await cq.message.answer(f"Удалено архивных версий (все типы): {deleted}")
+    try:
+        audit.log(
+            "OWNER_MATERIAL_ARCHIVE_DELETE_ALL",
+            actor.id,
+            meta={"week": week, "deleted": int(deleted)},
+        )
+    except Exception:
+        pass
+    await cq.answer()
 
 
 @router.callback_query(_is("own", {"materials_week"}))

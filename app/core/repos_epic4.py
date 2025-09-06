@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+
+from app.core.files import MATERIALS_DIR, link_or_copy, move_file, safe_filename
 
 # В проекте подключение к БД — так:
 from app.db.conn import db
@@ -22,6 +25,9 @@ class Material:
     created_at_utc: int
     week_no: Optional[int] = None
     visibility: Optional[str] = None
+    type: Optional[str] = None  # 'p','m','n','s','v'
+    is_active: Optional[int] = None  # 1 or 0
+    version: Optional[int] = None
 
 
 # ---------- MATERIALS (недельные, с видимостью) ----------
@@ -39,10 +45,11 @@ def list_materials_by_week(week_no: int, audience: str = "student") -> List[Mate
             rows = conn.execute(
                 """
                 SELECT m.id, m.week_id, m.path, m.sha256, m.size_bytes, m.mime,
-                       m.uploaded_by, m.created_at_utc, w.week_no, m.visibility
+                       m.uploaded_by, m.created_at_utc, w.week_no, m.visibility,
+                       m.type, m.is_active, m.version
                 FROM materials m
                 JOIN weeks w ON w.id = m.week_id
-                WHERE w.week_no = ?
+                WHERE w.week_no = ? AND m.is_active = 1
                 ORDER BY m.id ASC
                 """,
                 (week_no,),
@@ -51,11 +58,13 @@ def list_materials_by_week(week_no: int, audience: str = "student") -> List[Mate
             rows = conn.execute(
                 """
                 SELECT m.id, m.week_id, m.path, m.sha256, m.size_bytes, m.mime,
-                       m.uploaded_by, m.created_at_utc, w.week_no, m.visibility
+                       m.uploaded_by, m.created_at_utc, w.week_no, m.visibility,
+                       m.type, m.is_active, m.version
                 FROM materials m
                 JOIN weeks w ON w.id = m.week_id
                 WHERE w.week_no = ?
                   AND m.visibility = 'public'
+                  AND m.is_active = 1
                 ORDER BY m.id ASC
                 """,
                 (week_no,),
@@ -71,28 +80,279 @@ def insert_week_material_file(
     size_bytes: int,
     mime: Optional[str],
     visibility: str = "public",
+    type: str = "p",
+    original_name: Optional[str] = None,
 ) -> int:
+    """Insert material for week with versioning.
+
+    - If duplicate content (sha256+size) exists anywhere, returns -1.
+    - Sets new row as active and bumps version = (max(version) + 1) per (week_id,type).
+    - Previous active (if any) for (week_id,type) becomes archived (is_active=0).
+    """
     assert visibility in ("public", "teacher_only")
+    assert type in ("p", "m", "n", "s", "v")
     with db() as conn:
         wk = conn.execute("SELECT id FROM weeks WHERE week_no=?", (week_no,)).fetchone()
         if not wk:
             raise ValueError("unknown week_no")
         week_id = int(wk[0])
+        # Compute next version for this (week_id,type)
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM materials WHERE week_id=? AND type=?",
+            (week_id, type),
+        ).fetchone()
+        next_ver = int(row[0] or 0) + 1
+
+        # Prepare filesystem layout
+        fname = safe_filename(original_name or os.path.basename(path) or "material.bin")
+        base_dir = os.path.join(MATERIALS_DIR, f"W{week_no}", type)
+        active_dir = os.path.join(base_dir, "active")
+        active_path = os.path.join(active_dir, fname)
+
+        # Detect duplicate content BEFORE any state change to avoid losing active
+        dup = conn.execute(
+            "SELECT id, week_id, type, is_active, path, version FROM materials WHERE sha256=? AND size_bytes=? LIMIT 1",
+            (sha256, size_bytes),
+        ).fetchone()
+        if dup:
+            dup_id = int(dup[0])
+            dup_week_id = int(dup[1])
+            dup_type = str(dup[2])
+            dup_active = int(dup[3] or 0)
+            dup_path = str(dup[4]) if dup[4] is not None else None
+            # Same (week,type): if already active — skip; if archived — promote to active with new version
+            if dup_week_id == week_id and dup_type == type:
+                if dup_active == 1:
+                    return -1
+                # Archive previous active (if any)
+                prev = conn.execute(
+                    "SELECT id, path, version FROM materials WHERE week_id=? AND type=? AND is_active=1 LIMIT 1",
+                    (week_id, type),
+                ).fetchone()
+                if prev:
+                    prev_id = int(prev[0])
+                    prev_path = str(prev[1])
+                    prev_ver = int(prev[2] or 1)
+                    prev_name = os.path.basename(prev_path) or fname
+                    archive_path_prev = os.path.join(
+                        base_dir, f"v{prev_ver}", prev_name
+                    )
+                    try:
+                        move_file(prev_path, archive_path_prev)
+                    except Exception:
+                        pass
+                    conn.execute(
+                        "UPDATE materials SET is_active=0, path=? WHERE id=?",
+                        (archive_path_prev, prev_id),
+                    )
+                # Promote archived duplicate to active
+                try:
+                    if dup_path and os.path.exists(dup_path):
+                        move_file(dup_path, active_path)
+                    else:
+                        link_or_copy(path, active_path)
+                except Exception:
+                    try:
+                        link_or_copy(path, active_path)
+                    except Exception:
+                        return -1
+                conn.execute(
+                    (
+                        "UPDATE materials SET is_active=1, path=?, mime=?, visibility=?, "
+                        "uploaded_by=?, created_at_utc=strftime('%s','now'), version=? WHERE id=?"
+                    ),
+                    (
+                        active_path,
+                        mime,
+                        visibility,
+                        uploaded_by,
+                        next_ver,
+                        dup_id,
+                    ),
+                )
+                return dup_id
+            # Duplicate exists elsewhere (global unique index) — skip
+            return -1
+
+        # No duplicates: archive previous active and insert a new row
+        prev = conn.execute(
+            "SELECT id, path, version FROM materials WHERE week_id=? AND type=? AND is_active=1 LIMIT 1",
+            (week_id, type),
+        ).fetchone()
+        if prev:
+            prev_id = int(prev[0])
+            prev_path = str(prev[1])
+            prev_ver = int(prev[2] or 1)
+            prev_name = os.path.basename(prev_path) or fname
+            archive_path_prev = os.path.join(base_dir, f"v{prev_ver}", prev_name)
+            try:
+                move_file(prev_path, archive_path_prev)
+            except Exception:
+                pass
+            conn.execute(
+                "UPDATE materials SET is_active=0, path=? WHERE id=?",
+                (archive_path_prev, prev_id),
+            )
+
         try:
+            # Materialize new active file (hardlink or copy from blob path)
+            link_or_copy(path, active_path)
             cur = conn.execute(
                 """
                 INSERT INTO materials(
                   week_id, path, sha256, size_bytes,
-                  mime, visibility, uploaded_by, created_at_utc
+                  mime, visibility, uploaded_by, created_at_utc,
+                  type, is_active, version
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+                VALUES(?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), ?, 1, ?)
                 """,
-                (week_id, path, sha256, size_bytes, mime, visibility, uploaded_by),
+                (
+                    week_id,
+                    active_path,
+                    sha256,
+                    size_bytes,
+                    mime,
+                    visibility,
+                    uploaded_by,
+                    type,
+                    next_ver,
+                ),
             )
-            return cur.lastrowid
+            return int(cur.lastrowid)
         except sqlite3.IntegrityError:
-            # Duplicate content (sha256 + size) — treat as already exists
+            # Safety net: treat any race/dup as already exists
             return -1
+
+
+def get_active_material(week_id: int, type: str) -> Optional[Material]:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT m.id, m.week_id, m.path, m.sha256, m.size_bytes, m.mime,
+                   m.uploaded_by, m.created_at_utc, w.week_no, m.visibility,
+                   m.type, m.is_active, m.version
+            FROM materials m
+            JOIN weeks w ON w.id = m.week_id
+            WHERE m.week_id=? AND m.type=? AND m.is_active=1
+            LIMIT 1
+            """,
+            (week_id, type),
+        ).fetchone()
+    return Material(*row) if row else None
+
+
+def list_material_versions(week_id: int, type: str, limit: int = 20) -> List[Material]:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.id, m.week_id, m.path, m.sha256, m.size_bytes, m.mime,
+                   m.uploaded_by, m.created_at_utc, w.week_no, m.visibility,
+                   m.type, m.is_active, m.version
+            FROM materials m
+            JOIN weeks w ON w.id = m.week_id
+            WHERE m.week_id=? AND m.type=?
+            ORDER BY m.version DESC, m.id DESC
+            LIMIT ?
+            """,
+            (week_id, type, limit),
+        ).fetchall()
+    return [Material(*r) for r in rows]
+
+
+def archive_active(week_id: int, type: str) -> bool:
+    """Deactivate current active version for (week_id,type). Returns True if changed something."""
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT m.id, m.path, m.version, w.week_no
+            FROM materials m JOIN weeks w ON w.id=m.week_id
+            WHERE m.week_id=? AND m.type=? AND m.is_active=1
+            LIMIT 1
+            """,
+            (week_id, type),
+        ).fetchone()
+        if not row:
+            return False
+        mid = int(row[0])
+        cur_path = str(row[1])
+        ver = int(row[2] or 1)
+        week_no = int(row[3])
+        base_dir = os.path.join(MATERIALS_DIR, f"W{week_no}", type)
+        new_path = os.path.join(
+            base_dir, f"v{ver}", os.path.basename(cur_path) or "material.bin"
+        )
+        try:
+            move_file(cur_path, new_path)
+        except Exception:
+            pass
+        conn.execute(
+            "UPDATE materials SET is_active=0, path=? WHERE id=?",
+            (new_path, mid),
+        )
+        return True
+
+
+def delete_archived(week_id: int, type: Optional[str] = None) -> int:
+    """Delete archived versions. If type is None, deletes for all types of the week.
+    Returns number of deleted rows.
+    """
+    with db() as conn:
+        if type is None:
+            rows = conn.execute(
+                "SELECT id, path FROM materials WHERE week_id=? AND is_active=0",
+                (week_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, path FROM materials WHERE week_id=? AND type=? AND is_active=0",
+                (week_id, type),
+            ).fetchall()
+        ids = [int(r[0]) for r in rows]
+        for _, p in rows:
+            try:
+                os.remove(str(p))
+            except Exception:
+                pass
+        if not ids:
+            return 0
+        qmarks = ",".join(["?"] * len(ids))
+        conn.execute(f"DELETE FROM materials WHERE id IN ({qmarks})", ids)
+        return len(ids)
+
+
+def enforce_archive_limit(week_id: int, type: str, max_versions: int = 20) -> int:
+    """Ensure that total versions for (week_id,type) do not exceed max_versions.
+    If exceed, delete oldest archived versions after making a backup outside of this function.
+    Returns number of deleted rows.
+    """
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(1) FROM materials WHERE week_id=? AND type=?",
+            (week_id, type),
+        ).fetchone()
+        total = int(row[0] or 0)
+        if total <= max_versions:
+            return 0
+        to_delete = total - max_versions
+        # Fetch oldest archived candidates
+        rows = conn.execute(
+            (
+                "SELECT id, path FROM materials "
+                "WHERE week_id=? AND type=? AND is_active=0 "
+                "ORDER BY version ASC, id ASC LIMIT ?"
+            ),
+            (week_id, type, to_delete),
+        ).fetchall()
+        ids = [int(r[0]) for r in rows]
+        for _, p in rows:
+            try:
+                os.remove(str(p))
+            except Exception:
+                pass
+        if ids:
+            qmarks = ",".join(["?"] * len(ids))
+            conn.execute(f"DELETE FROM materials WHERE id IN ({qmarks})", ids)
+        return len(ids)
 
 
 # ---------- WEEK SUBMISSIONS (недельные, многофайловые) ----------
