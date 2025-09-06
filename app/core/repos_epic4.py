@@ -111,8 +111,11 @@ def insert_week_material_file(
 
         # Detect duplicate content BEFORE any state change to avoid losing active
         dup = conn.execute(
-            "SELECT id, week_id, type, is_active, path, version FROM materials WHERE sha256=? AND size_bytes=? LIMIT 1",
-            (sha256, size_bytes),
+            (
+                "SELECT id, week_id, type, is_active, path, version FROM materials "
+                "WHERE week_id=? AND type=? AND sha256=? AND size_bytes=? LIMIT 1"
+            ),
+            (week_id, type, sha256, size_bytes),
         ).fetchone()
         if dup:
             dup_id = int(dup[0])
@@ -171,8 +174,8 @@ def insert_week_material_file(
                     ),
                 )
                 return dup_id
-            # Duplicate exists elsewhere (global unique index) — skip
-            return -1
+            # Duplicate exists only if matches same (week_id,type); allow same content elsewhere
+            # No action here — proceed to insert as a new version below
 
         # No duplicates: archive previous active and insert a new row
         prev = conn.execute(
@@ -261,6 +264,21 @@ def list_material_versions(week_id: int, type: str, limit: int = 20) -> List[Mat
 
 def archive_active(week_id: int, type: str) -> bool:
     """Deactivate current active version for (week_id,type). Returns True if changed something."""
+    # For video links ('v'), there is no filesystem object to move — just toggle is_active.
+    if type == "v":
+        with db() as conn:
+            row = conn.execute(
+                "SELECT id FROM materials WHERE week_id=? AND type=? AND is_active=1 LIMIT 1",
+                (week_id, type),
+            ).fetchone()
+            if not row:
+                return False
+            mid = int(row[0])
+            conn.execute(
+                "UPDATE materials SET is_active=0 WHERE id=?",
+                (mid,),
+            )
+            return True
     with db() as conn:
         row = conn.execute(
             """
@@ -290,6 +308,97 @@ def archive_active(week_id: int, type: str) -> bool:
             (new_path, mid),
         )
         return True
+
+
+def insert_week_material_link(
+    week_no: int,
+    uploaded_by: str,
+    url: str,
+    visibility: str = "public",
+    type: str = "v",
+) -> int:
+    """Insert or promote a video link material for a week with versioning.
+
+    - Deduplicate within (week_id,type) by checksum of URL (size_bytes=0).
+    - If same checksum exists and is active → return -1.
+    - If same checksum exists but archived → promote it to active with next version.
+    - Otherwise insert new active row and archive previous active if any.
+    """
+    assert visibility in ("public", "teacher_only")
+    assert type == "v"
+    import hashlib
+
+    sha256 = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    size_bytes = 0
+    mime = "text/uri-list"
+    with db() as conn:
+        wk = conn.execute("SELECT id FROM weeks WHERE week_no=?", (week_no,)).fetchone()
+        if not wk:
+            raise ValueError("unknown week_no")
+        week_id = int(wk[0])
+        # Next version
+        row = conn.execute(
+            "SELECT COALESCE(MAX(version), 0) FROM materials WHERE week_id=? AND type=?",
+            (week_id, type),
+        ).fetchone()
+        next_ver = int(row[0] or 0) + 1
+
+        # Check for duplicate within (week_id,type)
+        dup = conn.execute(
+            (
+                "SELECT id, is_active FROM materials "
+                "WHERE week_id=? AND type=? AND sha256=? AND size_bytes=? LIMIT 1"
+            ),
+            (week_id, type, sha256, size_bytes),
+        ).fetchone()
+        if dup:
+            dup_id = int(dup[0])
+            dup_active = int(dup[1] or 0)
+            if dup_active == 1:
+                return -1
+            # Promote archived duplicate to active
+            conn.execute(
+                (
+                    "UPDATE materials SET is_active=1, path=?, mime=?, visibility=?, "
+                    "uploaded_by=?, created_at_utc=strftime('%s','now'), version=? WHERE id=?"
+                ),
+                (url, mime, visibility, uploaded_by, next_ver, dup_id),
+            )
+            return dup_id
+
+        # Archive previous active if any
+        prev = conn.execute(
+            "SELECT id FROM materials WHERE week_id=? AND type=? AND is_active=1 LIMIT 1",
+            (week_id, type),
+        ).fetchone()
+        if prev:
+            conn.execute(
+                "UPDATE materials SET is_active=0 WHERE id=?",
+                (int(prev[0]),),
+            )
+
+        cur = conn.execute(
+            """
+            INSERT INTO materials(
+              week_id, path, sha256, size_bytes,
+              mime, visibility, uploaded_by, created_at_utc,
+              type, is_active, version
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, strftime('%s','now'), ?, 1, ?)
+            """,
+            (
+                week_id,
+                url,
+                sha256,
+                size_bytes,
+                mime,
+                visibility,
+                uploaded_by,
+                type,
+                next_ver,
+            ),
+        )
+        return int(cur.lastrowid)
 
 
 def delete_archived(week_id: int, type: Optional[str] = None) -> int:

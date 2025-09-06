@@ -26,6 +26,7 @@ from app.core.repos_epic4 import (
     enforce_archive_limit,
     get_active_material,
     insert_week_material_file,
+    insert_week_material_link,
     list_material_versions,
     list_weeks,
 )
@@ -1725,17 +1726,26 @@ def _fmt_bytes(n: int | None) -> str:
 
 
 def _material_card_kb(
-    week: int, t: str, impersonating: bool
+    week: int, t: str, impersonating: bool, active_link: str | None = None
 ) -> types.InlineKeyboardMarkup:
+    lock = " 🔒" if impersonating else ""
+    is_video = t == "v"
+    up_text = ("🔗 Вставить ссылку" if is_video else "⬆️ Загрузить") + lock
+    second_btn_text = "🔗 Открыть ссылку" if is_video else "📂 Скачать активное"
+    second_btn_kwargs = (
+        {"url": active_link}
+        if is_video and active_link
+        else {"callback_data": cb("mat_download", {"w": week, "t": t})}
+    )
     rows = [
         [
             types.InlineKeyboardButton(
-                text="⬆️ Загрузить" + (" 🔒" if impersonating else ""),
+                text=up_text,
                 callback_data=cb("mat_upload", {"w": week, "t": t}),
             ),
             types.InlineKeyboardButton(
-                text="📂 Скачать активное",
-                callback_data=cb("mat_download", {"w": week, "t": t}),
+                text=second_btn_text,
+                **second_btn_kwargs,
             ),
         ],
         [
@@ -1772,16 +1782,33 @@ async def ownui_material_type(cq: types.CallbackQuery, actor: Identity):
     emoji, label = _mat_type_label(t)
     wk_id = _week_id_by_no(week)
     active_line = "<i>Активной версии нет</i>"
+    active_link = None
     if wk_id is not None:
         mat = get_active_material(wk_id, t)
         if mat:
-            fname = os.path.basename(mat.path or "") or "—"
-            size = _fmt_bytes(int(mat.size_bytes or 0))
-            active_line = f"<b>Активная:</b> {fname} · v{mat.version} · {size}"
+            if t == "v":
+                url = mat.path or ""
+                active_link = url if url.startswith("http") else None
+                # Show clickable host/link for video
+                try:
+                    from urllib.parse import urlparse
+
+                    host = urlparse(url).netloc or "ссылка"
+                except Exception:
+                    host = "ссылка"
+                active_line = (
+                    f'<b>Активная:</b> <a href="{url}">{host}</a> · v{mat.version}'
+                )
+            else:
+                fname = os.path.basename(mat.path or "") or "—"
+                size = _fmt_bytes(int(mat.size_bytes or 0))
+                active_line = f"<b>Активная:</b> {fname} · v{mat.version} · {size}"
     header = f"<b>{emoji} {label}</b>\n" f"<b>Неделя:</b> W{week}\n" f"{active_line}"
     await cq.message.answer(
         banner + header,
-        reply_markup=_material_card_kb(week, t, impersonating=bool(imp)),
+        reply_markup=_material_card_kb(
+            week, t, impersonating=bool(imp), active_link=active_link
+        ),
         parse_mode="HTML",
     )
     await cq.answer()
@@ -1800,8 +1827,18 @@ async def ownui_mat_upload(cq: types.CallbackQuery, actor: Identity):
     week = int(payload.get("w", 0))
     t = payload.get("t", "p")
     if t == "v":
-        # Video material is a link upload (cloud/YouTube). Put a stub for now.
-        return await cq.answer("Загрузка ссылок на видео — заглушка", show_alert=True)
+        # Expect a URL text for video links
+        state_store.put_at(
+            _mat_key(_uid(cq)),
+            "own_mat",
+            {"mode": "await_link", "w": week, "t": t},
+            ttl_sec=900,
+        )
+        banner = await _maybe_banner(_uid(cq))
+        await cq.message.answer(
+            banner + "Вставьте ссылку (http/https) на запись лекции"
+        )
+        return await cq.answer()
     # set state to await document
     state_store.put_at(
         _mat_key(_uid(cq)),
@@ -1820,6 +1857,94 @@ def _awaits_mat_doc(m: types.Message) -> bool:
         return act == "own_mat" and (st or {}).get("mode") == "await_doc"
     except Exception:
         return False
+
+
+def _awaits_mat_link(m: types.Message) -> bool:
+    try:
+        act, st = state_store.get(_mat_key(m.from_user.id))
+        return act == "own_mat" and (st or {}).get("mode") == "await_link"
+    except Exception:
+        return False
+
+
+def _is_valid_url(u: str) -> bool:
+    try:
+        if not u:
+            return False
+        u = u.strip()
+        if len(u) == 0 or len(u) > 2000:
+            return False
+        if any(ch.isspace() for ch in u):
+            return False
+        return u.startswith("http://") or u.startswith("https://")
+    except Exception:
+        return False
+
+
+@router.message(F.text, _awaits_mat_link)
+async def ownui_mat_receive_link(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    try:
+        _, st = state_store.get(_mat_key(_uid(m)))
+    except Exception:
+        return
+    week = int(st.get("w", 0))
+    t = str(st.get("t", "v"))
+    url = (m.text or "").strip()
+    if not _is_valid_url(url):
+        return await m.answer(
+            "⛔ Некорректная ссылка. Допустимы только http/https, длина ≤ 2000 символов."
+        )
+    vis = _visibility_for_type(t)
+    mid = insert_week_material_link(
+        week_no=week,
+        uploaded_by=actor.id,
+        url=url,
+        visibility=vis,
+        type=t,
+    )
+    if mid == -1:
+        await m.answer(
+            "⚠️ Ссылка идентична активной версии или уже существует — загрузка пропущена"
+        )
+        return
+    # Enforce archive limit after backup if needed
+    wk_id = _week_id_by_no(week)
+    if wk_id is not None:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(1) FROM materials WHERE week_id=? AND type=?",
+                (wk_id, t),
+            ).fetchone()
+            total = int(row[0] or 0)
+        if total > 20:
+            try:
+                trigger_backup("auto")
+            except Exception:
+                pass
+            removed = enforce_archive_limit(wk_id, t, max_versions=20)
+            if removed > 0:
+                await m.answer(f"⚠️ Удалены старые архивные версии: {removed}")
+    # Audit
+    try:
+        wk_id = _week_id_by_no(week)
+        mat = get_active_material(wk_id, t) if wk_id is not None else None
+        audit.log(
+            "OWNER_MATERIAL_UPLOAD",
+            actor.id,
+            meta={
+                "week": week,
+                "type": t,
+                "size_bytes": 0,
+                "sha256": getattr(mat, "sha256", None),
+                "version": int(getattr(mat, "version", 0) or 0),
+            },
+        )
+    except Exception:
+        pass
+    await m.answer("✅ Ссылка сохранена")
+    state_store.delete(_mat_key(_uid(m)))
 
 
 @router.message(F.document, _awaits_mat_doc)
@@ -1933,7 +2058,26 @@ async def ownui_mat_download(cq: types.CallbackQuery, actor: Identity):
     if wk_id is None:
         return await cq.answer("Неделя не найдена", show_alert=True)
     mat = get_active_material(wk_id, t)
-    if not mat or not BufferedInputFile:
+    if not mat:
+        return await cq.answer("Нет активной версии", show_alert=True)
+    if t == "v":
+        # Send clickable link instead of a document
+        try:
+            await cq.message.answer(
+                f"🔗 Ссылка на запись лекции (W{week}):\n{mat.path}"
+            )
+            try:
+                audit.log(
+                    "OWNER_MATERIAL_DOWNLOAD",
+                    actor.id,
+                    meta={"week": week, "type": t, "version": int(mat.version or 0)},
+                )
+            except Exception:
+                pass
+        except Exception:
+            return await cq.answer("Не удалось отправить ссылку", show_alert=True)
+        return await cq.answer()
+    if not BufferedInputFile:
         return await cq.answer("Нет активной версии", show_alert=True)
     try:
         with open(mat.path, "rb") as f:
