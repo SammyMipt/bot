@@ -1,4 +1,4 @@
-.PHONY: init dev run-bot lint fmt test doctor dirs migrate seed clean-db fix-eol
+.PHONY: init dev run-bot lint fmt test doctor dirs migrate seed clean-db fix-eol lint-ci cov-summary
 
 PY=poetry run
 DEV_DIRS=var var/materials var/submissions var/exports var/tmp var/logs
@@ -14,6 +14,12 @@ run-bot:
 
 lint:
 	poetry run flake8 -j1 app
+
+# Linting in CI-style: check-only and full repo scope
+lint-ci:
+	poetry run isort --check-only .
+	poetry run black --check .
+	poetry run flake8
 
 fmt:
 	poetry run black app tests && poetry run isort app tests
@@ -41,9 +47,11 @@ state-clean:
 	$(PY) python scripts/cleanup_state.py
 
 .PHONY: ci
-ci: fmt lint test
+# Align with GitHub Actions: lint (check-only), migrate DB, tests, coverage summary
+ci: lint-ci migrate test cov-summary
 
-.PHONY: test-cov
-test-cov:
+
+.PHONY: cov-summary
+cov-summary:
 	poetry run pytest -q --maxfail=1 --disable-warnings \
-		--cov=app --cov=scripts --cov-report=term-missing:skip-covered
+		--cov=app --cov-report=term-missing:skip-covered
