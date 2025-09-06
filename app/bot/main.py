@@ -1,16 +1,17 @@
 import asyncio
 import logging
 
-from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 
+from aiogram import Bot, Dispatcher
 from app.bot.commands_epic4_owner import router as epic4_owner_router
 from app.bot.commands_epic4_student import router as epic4_student_router
 from app.bot.commands_epic4_teacher import router as epic4_teacher_router
 from app.bot.commands_epic5_register import router as epic5_register_router
 from app.bot.commands_epic5_register_owner import router as epic5_register_owner_router
 from app.bot.demo_epic2 import router as demo_router
-from app.core.cleanup import periodic_cleanup
+from app.bot.ui_owner_stub import router as ui_owner_stub_router
+from app.core.cleanup import periodic_backup_daily, periodic_cleanup
 from app.core.config import cfg
 from app.core.logging import setup_logging
 
@@ -41,6 +42,8 @@ async def main():
     from app.bot.commands_epic3 import router as epic3_router
 
     dp.include_router(epic3_router)
+    # 🔽 OWNER UI: place before registration to avoid conflicts with broad text handlers
+    dp.include_router(ui_owner_stub_router)
     # 🔽 EPIC-5: registration router
     dp.include_router(epic5_register_owner_router)
     dp.include_router(epic5_register_router)
@@ -50,6 +53,8 @@ async def main():
     dp.include_router(epic4_student_router)
 
     asyncio.create_task(periodic_cleanup())
+    # Daily auto-backup at 03:00 UTC (per L3_Common)
+    asyncio.create_task(periodic_backup_daily(3, 0))
     await dp.start_polling(bot)
 
 

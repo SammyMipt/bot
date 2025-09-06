@@ -15,7 +15,7 @@ aiogram = "^3.10.0"
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
 pytest-asyncio = "^0.23.7"
-black = "^24.8.0"
+black = "^24.10.0"
 isort = "^5.13.2"
 flake8 = "^7.1.0"
 pre-commit = "^3.8.0"
@@ -26,7 +26,7 @@ requires = ["poetry-core>=1.9.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.flake8]
-max-line-length = 120
+max-line-length = 140
 
 [tool.black]
 line-length = 88

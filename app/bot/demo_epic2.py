@@ -1,7 +1,7 @@
-from aiogram import F, Router, types
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 
+from aiogram import F, Router, types
 from app.core import callbacks
 from app.core.auth import Identity
 

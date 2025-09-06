@@ -44,3 +44,43 @@ def db_tmpdir(tmp_path, monkeypatch):
             c.commit()
 
     return tmp_path
+
+
+# ---------------- Async test support (no external plugin) -----------------
+
+
+def pytest_configure(config):
+    # Register asyncio marker to avoid unknown-mark warnings
+    config.addinivalue_line("markers", "asyncio: mark test as async")
+
+
+def pytest_pyfunc_call(pyfuncitem):
+    """Execute async test functions via a local event loop.
+
+    This removes the need for pytest-asyncio and silences related warnings.
+    """
+    import asyncio
+    import inspect
+
+    testfunction = pyfuncitem.obj
+    if inspect.iscoroutinefunction(testfunction):
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            # Only pass fixtures that the function actually expects
+            argnames = tuple(getattr(pyfuncitem, "_fixtureinfo").argnames or ())
+            kwargs = {
+                name: pyfuncitem.funcargs[name]
+                for name in argnames
+                if name in pyfuncitem.funcargs
+            }
+            loop.run_until_complete(testfunction(**kwargs))
+        finally:
+            try:
+                loop.run_until_complete(asyncio.sleep(0))
+            except Exception:
+                pass
+            loop.close()
+            asyncio.set_event_loop(None)
+        return True
+    return None
