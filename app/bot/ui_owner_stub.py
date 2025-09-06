@@ -3,7 +3,7 @@ from __future__ import annotations
 from aiogram.filters import Command, CommandStart
 
 from aiogram import F, Router, types
-from app.core import callbacks, state_store
+from app.core import audit, callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
 from app.core.backup import backup_recent, trigger_backup
 from app.core.course_init import apply_course_init, parse_weeks_csv
@@ -42,6 +42,11 @@ def cb(action: str, params: dict | None = None) -> str:
     if params:
         payload.update(params)
     return callbacks.build("own", payload, role="owner")
+
+
+# Canonical assignment-matrix callbacks per L2: a=as; s=p|c
+def _cb_as(step: str) -> str:
+    return callbacks.build("own", {"a": "as", "s": step}, role="owner")
 
 
 def _get_impersonation(uid: int) -> dict | None:
@@ -171,6 +176,10 @@ def _people_imp_ck(uid: int, kind: str) -> str:
     return f"own_imp_ck:{uid}:{kind}"
 
 
+def _assign_key(uid: int) -> str:
+    return f"own_assign:{uid}"
+
+
 def _csv_filter_excess_columns(
     content: bytes, expected_headers: list[str]
 ) -> tuple[bytes, int, bool]:
@@ -247,6 +256,22 @@ def _is(op: str, actions: set[str]):
                 return False
             _, payload = state_store.get(key)
             return payload.get("action") in actions
+        except Exception:
+            return False
+
+    return _f
+
+
+def _is_as(step: str):
+    """Predicate for assignment-matrix callbacks using canonical notation a=as;s=<step>."""
+
+    def _f(cq: types.CallbackQuery) -> bool:
+        try:
+            op2, key = callbacks.parse(cq.data)
+            if op2 != "own":
+                return False
+            _, payload = state_store.get(key)
+            return payload.get("a") == "as" and payload.get("s") == step
         except Exception:
             return False
 
@@ -763,7 +788,7 @@ def _people_kb(impersonating: bool = False) -> types.InlineKeyboardMarkup:
         [
             types.InlineKeyboardButton(
                 text=f"Создать матрицу назначений{lock}",
-                callback_data=cb("people_matrix"),
+                callback_data=_cb_as("p"),
             )
         ],
         _nav_keyboard("people").inline_keyboard,
@@ -789,7 +814,7 @@ async def ownui_people(cq: types.CallbackQuery, actor: Identity):
     _is(
         "own",
         {
-            "people_matrix",
+            "people_matrix_stub",
         },
     )
 )
@@ -1930,9 +1955,7 @@ async def ownui_reports(cq: types.CallbackQuery, actor: Identity):
     _stack_push(_uid(cq), "reports", {})
 
 
-@router.callback_query(
-    _is("own", {"rep_audit", "rep_grades", "rep_matrix", "rep_course"})
-)
+@router.callback_query(_is("own", {"rep_audit", "rep_grades", "rep_course"}))
 async def ownui_reports_stubs(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
@@ -2097,4 +2120,380 @@ async def ownui_impersonation_stop(cq: types.CallbackQuery, actor: Identity):
     await cq.message.answer(
         banner + "Имперсонизация завершена.", reply_markup=_nav_keyboard("imp")
     )
+    await cq.answer()
+
+
+# -------- Assignment matrix (preview/commit) --------
+
+
+@router.callback_query(_is_as("p"))
+async def ownui_people_matrix_preview(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    # Extract to consume token and check impersonation
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    # Build preview
+    import uuid
+
+    with db() as conn:
+        weeks = [
+            r[0]
+            for r in conn.execute(
+                "SELECT week_no FROM weeks ORDER BY week_no ASC"
+            ).fetchall()
+        ]
+        students = conn.execute(
+            (
+                "SELECT id, COALESCE(name,''), COALESCE(group_name,'') "
+                "FROM users "
+                "WHERE role='student' AND (is_active IS NULL OR is_active=1) "
+                "ORDER BY COALESCE(group_name,''), COALESCE(name,''), id"
+            )
+        ).fetchall()
+        # Teachers include classic teachers and owner acting as teacher (capacity > 0)
+        teachers = conn.execute(
+            (
+                "SELECT id, COALESCE(name,''), COALESCE(capacity,0) FROM users "
+                "WHERE (role='teacher' OR (role='owner' AND tg_id=?)) "
+                "AND (is_active IS NULL OR is_active=1) AND COALESCE(capacity,0) > 0 "
+                "ORDER BY COALESCE(name,''), id"
+            ),
+            (actor.tg_id,),
+        ).fetchall()
+    if not weeks:
+        return await cq.answer("⛔ Недоступно: нет недель курса", show_alert=True)
+    if not students:
+        return await cq.answer("⛔ Недоступно: нет студентов", show_alert=True)
+    if not teachers:
+        return await cq.answer(
+            "⛔ Недоступно: нет преподавателей с положительным лимитом", show_alert=True
+        )
+    total_cap = sum(int(t[2]) for t in teachers)
+    if total_cap < len(students):
+        try:
+            audit.log(
+                "OWNER_ASSIGN_PREVIEW",
+                actor.id,
+                request_id=str(uuid.uuid4()),
+                meta={
+                    "error": "INSUFFICIENT_CAPACITY",
+                    "teachers": len(teachers),
+                    "weeks": len(weeks),
+                    "students": len(students),
+                    "total_capacity": total_cap,
+                },
+            )
+        except Exception:
+            pass
+        return await cq.answer(
+            f"⛔ Недостаточная суммарная вместимость преподавателей: {total_cap} < {len(students)}",
+            show_alert=True,
+        )
+
+    # Round-robin per week with rotation
+    def _assign_for_week(week_index: int):
+        remaining = {t[0]: int(t[2]) for t in teachers}
+        order = [t[0] for t in teachers]
+        pos = week_index % len(order)
+        result = []  # list of (student_id, teacher_id)
+        for sid, _, _ in students:
+            tried = 0
+            while tried < len(order) and remaining[order[pos]] <= 0:
+                pos = (pos + 1) % len(order)
+                tried += 1
+            if tried >= len(order):
+                break
+            tid = order[pos]
+            result.append((sid, tid))
+            remaining[tid] -= 1
+            pos = (pos + 1) % len(order)
+        return result
+
+    matrix = []  # list of dicts: {week_no, student_id, teacher_id}
+    for wi, w in enumerate(weeks):
+        pairs = _assign_for_week(wi)
+        for sid, tid in pairs:
+            matrix.append({"week_no": int(w), "student_id": sid, "teacher_id": tid})
+    # Save to StateStore for commit
+    req_id = str(uuid.uuid4())
+    state_store.put_at(
+        _assign_key(uid),
+        "assign_preview",
+        {
+            "req": req_id,
+            "weeks": weeks,
+            "students": [s[0] for s in students],
+            "teachers": [t[0] for t in teachers],
+            "matrix": matrix,
+        },
+        ttl_sec=900,
+    )
+    # Audit preview
+    try:
+        audit.log(
+            "OWNER_ASSIGN_PREVIEW",
+            actor.id,
+            request_id=req_id,
+            meta={
+                "strategy": "round_robin",
+                "teachers": len(teachers),
+                "weeks": len(weeks),
+                "students": len(students),
+            },
+        )
+    except Exception:
+        pass
+    # Render preview summary
+    teacher_lines = [
+        f"— {t[1] or '(без имени)'} (cap {int(t[2])})" for t in teachers[:10]
+    ]
+    more_teachers = "\n…" if len(teachers) > 10 else ""
+    lines = [
+        "📋 Предпросмотр матрицы назначений",
+        f"Студентов: {len(students)}; Преподавателей: {len(teachers)}; Недель: {len(weeks)}",
+        "Преподаватели:",
+        *teacher_lines,
+        more_teachers,
+        "\nПодтвердить создание матрицы?",
+    ]
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="✅ Подтвердить", callback_data=_cb_as("c")
+                ),
+                types.InlineKeyboardButton(text="Отмена", callback_data=cb("people")),
+            ],
+            _nav_keyboard("people").inline_keyboard[0],
+        ]
+    )
+    banner = await _maybe_banner(uid)
+    try:
+        await cq.message.edit_text(
+            banner + "\n".join([x for x in lines if x]), reply_markup=kb
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + "\n".join([x for x in lines if x]), reply_markup=kb
+        )
+    await cq.answer()
+
+
+@router.callback_query(_is_as("c"))
+async def ownui_people_matrix_commit(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    # one-shot token consume
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    try:
+        action, st = state_store.get(_assign_key(uid))
+    except Exception:
+        action, st = None, None
+    if action != "assign_preview" or not st:
+        return await cq.answer("Сессия истекла, повторите шаг", show_alert=True)
+    matrix = st.get("matrix") or []
+    req_id = st.get("req")
+    import time
+
+    now = int(time.time())
+    # Revalidate snapshot to avoid FK slips
+
+    try:
+        with db() as conn:
+            weeks_cur = {
+                int(r[0]) for r in conn.execute("SELECT week_no FROM weeks").fetchall()
+            }
+            students_cur = {
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT id FROM users WHERE role='student' AND (is_active IS NULL OR is_active=1)"
+                ).fetchall()
+            }
+            teachers_rows = conn.execute(
+                (
+                    "SELECT id, COALESCE(capacity,0) FROM users "
+                    "WHERE (role='teacher' OR (role='owner' AND tg_id=?)) "
+                    "AND (is_active IS NULL OR is_active=1) AND COALESCE(capacity,0) > 0"
+                ),
+                (actor.tg_id,),
+            ).fetchall()
+            teachers_cur = {str(r[0]) for r in teachers_rows}
+            total_cap = sum(int(r[1]) for r in teachers_rows)
+        # Validate references and capacity
+        if total_cap < len(st.get("students", [])):
+            try:
+                audit.log(
+                    "OWNER_ASSIGN_COMMIT",
+                    actor.id,
+                    request_id=req_id,
+                    meta={"error": "INSUFFICIENT_CAPACITY"},
+                )
+            except Exception:
+                pass
+            return await cq.answer(
+                "⛔ Недостаточная суммарная вместимость преподавателей. Пересоздайте превью.",
+                show_alert=True,
+            )
+        for row in matrix:
+            if (
+                int(row.get("week_no", 0)) not in weeks_cur
+                or str(row.get("student_id")) not in students_cur
+                or str(row.get("teacher_id")) not in teachers_cur
+            ):
+                try:
+                    audit.log(
+                        "OWNER_ASSIGN_COMMIT",
+                        actor.id,
+                        request_id=req_id,
+                        meta={"error": "E_STATE_INVALID_CHANGED"},
+                    )
+                except Exception:
+                    pass
+                return await cq.answer(
+                    "⛔ Данные изменились. Создайте превью заново.", show_alert=True
+                )
+    except Exception:
+        # Best-effort: if revalidation fails, continue to DB write guarded by FK
+        pass
+    try:
+        with db() as conn:
+            conn.execute("BEGIN")
+            sql = (
+                "INSERT INTO teacher_student_assignments(week_no, teacher_id, student_id, created_at_utc) "
+                "VALUES(?,?,?,?) "
+                "ON CONFLICT(week_no, student_id) DO UPDATE SET teacher_id=excluded.teacher_id, created_at_utc=excluded.created_at_utc"
+            )
+            for row in matrix:
+                conn.execute(
+                    sql,
+                    (
+                        int(row["week_no"]),
+                        str(row["teacher_id"]),
+                        str(row["student_id"]),
+                        now,
+                    ),
+                )
+            conn.commit()
+    except Exception as e:
+        # audit failure
+        try:
+            audit.log(
+                "OWNER_ASSIGN_COMMIT",
+                actor.id,
+                request_id=req_id,
+                meta={"error": str(e)},
+            )
+        except Exception:
+            pass
+        return await cq.answer("⛔ Не удалось применить матрицу", show_alert=True)
+    # Audit commit
+    try:
+        audit.log(
+            "OWNER_ASSIGN_COMMIT",
+            actor.id,
+            request_id=req_id,
+            meta={"rows": len(matrix)},
+        )
+    except Exception:
+        pass
+    # Cleanup state
+    try:
+        state_store.delete(_assign_key(uid))
+    except Exception:
+        pass
+    banner = await _maybe_banner(uid)
+    await cq.message.answer(
+        banner + "✅ Матрица создана", reply_markup=_nav_keyboard("people")
+    )
+    await cq.answer()
+
+
+# -------- Reports: assignment matrix export --------
+
+
+@router.callback_query(_is("own", {"rep_matrix"}))
+async def ownui_reports_matrix(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    # gасим токен
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    if not backup_recent():
+        return await cq.answer("⛔ Недоступно: нет свежего бэкапа", show_alert=True)
+    # Build wide CSV: student, group, Wxx...
+    import csv
+    import io
+    import time as _t
+
+    with db() as conn:
+        weeks = [
+            r[0]
+            for r in conn.execute(
+                "SELECT week_no FROM weeks ORDER BY week_no ASC"
+            ).fetchall()
+        ]
+        students = conn.execute(
+            (
+                "SELECT id, COALESCE(name,''), COALESCE(group_name,'') "
+                "FROM users "
+                "WHERE role='student' AND (is_active IS NULL OR is_active=1) "
+                "ORDER BY COALESCE(group_name,''), COALESCE(name,''), id"
+            )
+        ).fetchall()
+        # Build map (student_id, week_no) -> teacher name (works for owner-as-teacher too)
+        rows = conn.execute(
+            (
+                "SELECT tsa.student_id, tsa.week_no, COALESCE(u.name,'') "
+                "FROM teacher_student_assignments tsa "
+                "JOIN users u ON u.id = tsa.teacher_id"
+            )
+        ).fetchall()
+    # Explicit error if matrix does not exist (no assignments at all)
+    if not rows:
+        return await cq.answer("⛔ Матрица назначений не создана", show_alert=True)
+    m = {(str(r[0]), int(r[1])): (r[2] or "") for r in rows}
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    header = ["student", "group"] + [f"W{int(x):02d}" for x in weeks]
+    w.writerow(header)
+    for sid, sname, sgroup in students:
+        row = [sname or "", sgroup or ""]
+        for wk in weeks:
+            row.append(m.get((str(sid), int(wk)), ""))
+        w.writerow(row)
+    data = buf.getvalue().encode("utf-8")
+    ts = _t.strftime("%Y%m%d_%H%M%S", _t.gmtime())
+    try:
+        await cq.message.answer_document(
+            types.BufferedInputFile(data, filename=f"assignment_matrix_{ts}.csv"),
+            caption="Экспорт assignment matrix (CSV)",
+        )
+        try:
+            audit.log(
+                "OWNER_REPORT_EXPORT", actor.id, meta={"type": "assignment_matrix_csv"}
+            )
+        except Exception:
+            pass
+    except Exception:
+        return await cq.answer(
+            "⛔ Не удалось сформировать/отправить экспорт", show_alert=True
+        )
     await cq.answer()
