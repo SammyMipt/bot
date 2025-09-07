@@ -11,6 +11,7 @@ from app.bot.commands_epic5_register import router as epic5_register_router
 from app.bot.commands_epic5_register_owner import router as epic5_register_owner_router
 from app.bot.demo_epic2 import router as demo_router
 from app.bot.ui_owner_stub import router as ui_owner_stub_router
+from app.bot.ui_teacher_stub import router as ui_teacher_stub_router
 from app.core.cleanup import periodic_backup_daily, periodic_cleanup
 from app.core.config import cfg
 from app.core.logging import setup_logging
@@ -42,8 +43,9 @@ async def main():
     from app.bot.commands_epic3 import router as epic3_router
 
     dp.include_router(epic3_router)
-    # 🔽 OWNER UI: place before registration to avoid conflicts with broad text handlers
+    # 🔽 OWNER/TEACHER UI: place before registration to avoid conflicts with broad text handlers
     dp.include_router(ui_owner_stub_router)
+    dp.include_router(ui_teacher_stub_router)
     # 🔽 EPIC-5: registration router
     dp.include_router(epic5_register_owner_router)
     dp.include_router(epic5_register_router)

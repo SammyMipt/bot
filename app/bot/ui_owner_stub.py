@@ -280,7 +280,7 @@ async def owner_menu_on_start(m: types.Message, actor: Identity):
             inline_keyboard=[
                 [
                     types.InlineKeyboardButton(
-                        text="👑 Владелец: главное меню",
+                        text="👑 Главное меню владельца",
                         callback_data=cb("start_owner"),
                     )
                 ],
@@ -374,13 +374,55 @@ async def own_start_teacher(cq: types.CallbackQuery, actor: Identity):
         callbacks.extract(cq.data, expected_role=actor.role)
     except Exception:
         pass
-    # Show a stub page for Teacher main menu (consistent with stubs style)
-    banner = await _maybe_banner(_uid(cq))
-    msg = "📚 Главное меню преподавателя\n\n⛔ Функция не реализована"
+    # Show Teacher main menu (owner-as-teacher). Build buttons with role=owner.
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="➕ Создать расписание",
+                    callback_data=callbacks.build(
+                        "t", {"action": "sch_create"}, role="owner"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📅 Управление расписанием",
+                    callback_data=callbacks.build(
+                        "t", {"action": "sch_manage"}, role="owner"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="🧩 Мои пресеты",
+                    callback_data=callbacks.build(
+                        "t", {"action": "presets"}, role="owner"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📚 Методические материалы",
+                    callback_data=callbacks.build(
+                        "t", {"action": "materials"}, role="owner"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📝 Проверка работ",
+                    callback_data=callbacks.build(
+                        "t", {"action": "checkwork"}, role="owner"
+                    ),
+                )
+            ],
+        ]
+    )
     try:
-        await cq.message.edit_text(msg, reply_markup=_nav_keyboard("root"))
+        await cq.message.edit_text("📚 Главное меню преподавателя", reply_markup=kb)
     except Exception:
-        await cq.message.answer(banner + msg, reply_markup=_nav_keyboard("root"))
+        await cq.message.answer("📚 Главное меню преподавателя", reply_markup=kb)
     await cq.answer()
 
 
@@ -2819,6 +2861,87 @@ async def ownui_impersonation_receive(m: types.Message, actor: Identity):
 
 @router.callback_query(_is("own", {"imp_student_menu", "imp_teacher_menu"}))
 async def ownui_impersonation_menus(cq: types.CallbackQuery, actor: Identity):
+    # Open target role menu while staying in owner UI message context
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        payload = {"action": "imp_teacher_menu"}
+    action = payload.get("action")
+    if action == "imp_teacher_menu":
+        # Build Teacher main menu with role=teacher so subsequent callbacks are executed as impersonated user
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="➕ Создать расписание",
+                        callback_data=callbacks.build(
+                            "t", {"action": "sch_create"}, role="teacher"
+                        ),
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="📅 Управление расписанием",
+                        callback_data=callbacks.build(
+                            "t", {"action": "sch_manage"}, role="teacher"
+                        ),
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="🧩 Мои пресеты",
+                        callback_data=callbacks.build(
+                            "t", {"action": "presets"}, role="teacher"
+                        ),
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="📚 Методические материалы",
+                        callback_data=callbacks.build(
+                            "t", {"action": "materials"}, role="teacher"
+                        ),
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="📝 Проверка работ",
+                        callback_data=callbacks.build(
+                            "t", {"action": "checkwork"}, role="teacher"
+                        ),
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="👑 Меню владельца",
+                        callback_data=callbacks.build(
+                            "own", {"action": "start_owner"}, role="owner"
+                        ),
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="↩️ Завершить имперсонизацию",
+                        callback_data=callbacks.build(
+                            "own", {"action": "imp_stop"}, role="owner"
+                        ),
+                    )
+                ],
+            ]
+        )
+        banner = await _maybe_banner(_uid(cq))
+        try:
+            await cq.message.edit_text(
+                banner + "📚 Главное меню преподавателя (имперсонизация)",
+                reply_markup=kb,
+            )
+        except Exception:
+            await cq.message.answer(
+                banner + "📚 Главное меню преподавателя (имперсонизация)",
+                reply_markup=kb,
+            )
+        return await cq.answer()
+    # Student menu not implemented yet
     await cq.answer("⛔ Функция не реализована", show_alert=True)
 
 
