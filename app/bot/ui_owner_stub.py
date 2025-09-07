@@ -270,13 +270,47 @@ async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
 
 @router.message(CommandStart())
 async def owner_menu_on_start(m: types.Message, actor: Identity):
-    # If already registered owner → show main menu automatically
+    # Only handle owners here; others are handled by registration router
     if actor.role != "owner":
         return
     uid = _uid(m)
+    # If owner also configured as teacher → offer a role chooser per docs
+    if _owner_has_teacher_cap(actor.id):
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="👑 Владелец: главное меню",
+                        callback_data=cb("start_owner"),
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="📚 Главное меню преподавателя",
+                        callback_data=cb("start_teacher"),
+                    )
+                ],
+            ]
+        )
+        await m.answer("Выберите раздел:", reply_markup=kb)
+        return
+    # Default: open owner main menu
     _stack_reset(uid)
     banner = await _maybe_banner(uid)
     await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
+
+
+def _owner_has_teacher_cap(user_id: str) -> bool:
+    """Return True if owner has teacher capacity configured (>0)."""
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT capacity FROM users WHERE id=? LIMIT 1", (user_id,)
+            ).fetchone()
+        cap = int(row[0]) if row and row[0] is not None else 0
+        return cap > 0
+    except Exception:
+        return False
 
 
 def _is(op: str, actions: set[str]):
@@ -307,6 +341,47 @@ def _is_as(step: str):
             return False
 
     return _f
+
+
+# ----- Start entry choice handlers (placed after _is definition) -----
+
+
+@router.callback_query(_is("own", {"start_owner"}))
+async def own_start_owner(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    uid = _uid(cq)
+    _stack_reset(uid)
+    banner = await _maybe_banner(uid)
+    try:
+        await cq.message.edit_text(
+            banner + "Главное меню", reply_markup=_main_menu_kb()
+        )
+    except Exception:
+        await cq.message.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"start_teacher"}))
+async def own_start_teacher(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    # Show a stub page for Teacher main menu (consistent with stubs style)
+    banner = await _maybe_banner(_uid(cq))
+    msg = "📚 Главное меню преподавателя\n\n⛔ Функция не реализована"
+    try:
+        await cq.message.edit_text(msg, reply_markup=_nav_keyboard("root"))
+    except Exception:
+        await cq.message.answer(banner + msg, reply_markup=_nav_keyboard("root"))
+    await cq.answer()
 
 
 @router.callback_query(_is("own", {"home"}))
