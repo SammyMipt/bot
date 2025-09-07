@@ -81,7 +81,6 @@ def _identity(tg_id: str, role: str = "guest"):
 def _set_cfg(
     course_secret: Optional[str] = None,
     owners: Optional[list[str]] = None,
-    override: Optional[str] = None,
 ):
     import app.core.config as config
 
@@ -90,14 +89,13 @@ def _set_cfg(
         config.cfg.course_secret = course_secret
     if owners is not None:
         config.cfg.telegram_owner_ids_raw = ",".join(owners)
-    if override is not None:
-        config.cfg.auth_tg_override = override
+    # AUTH_TG_OVERRIDE removed; no override applied
 
 
 async def _owner_flow_yes_capacity_tgname(capacity_value: int = 8):
     # Apply DB and config first, then (re)load module to ensure it sees cfg
     _apply_epic5_migration()
-    _set_cfg(course_secret="sec", owners=["100"], override="")
+    _set_cfg(course_secret="sec", owners=["100"])
     import importlib
 
     from app.bot import commands_epic5_register_owner as owner
@@ -135,7 +133,7 @@ async def test_owner_full_flow_yes_capacity_tgname():
 @pytest.mark.asyncio
 async def test_owner_flow_no_teacher_manual_name():
     _apply_epic5_migration()
-    _set_cfg(course_secret="sec", owners=["200"], override="")
+    _set_cfg(course_secret="sec", owners=["200"])
     import importlib
 
     from app.bot import commands_epic5_register_owner as owner

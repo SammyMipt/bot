@@ -30,18 +30,21 @@ def db_tmpdir(tmp_path, monkeypatch):
 
     importlib.reload(files)
 
-    mig_path = pathlib.Path("migrations/001_init.sql")
-    sql = mig_path.read_text(encoding="utf-8")
-    with conn.db() as c:
-        c.executescript(sql)
-        c.commit()
-
-    mig_path2 = pathlib.Path("migrations/003_state_store_action_params.sql")
-    if mig_path2.exists():
-        sql2 = mig_path2.read_text(encoding="utf-8")
+    # Apply required migrations for tests
+    migs = [
+        "migrations/001_init.sql",
+        "migrations/003_state_store_action_params.sql",
+    ]
+    for m in migs:
+        p = pathlib.Path(m)
+        if not p.exists():
+            continue
+        sql = p.read_text(encoding="utf-8")
         with conn.db() as c:
-            c.executescript(sql2)
+            c.executescript(sql)
             c.commit()
+
+    # Note: additional migrations are applied on-demand in specific tests to avoid conflicts.
 
     return tmp_path
 

@@ -1,3 +1,4 @@
+import pathlib
 import time
 import uuid
 
@@ -16,9 +17,7 @@ from app.core.repos_epic4 import (
 from app.db.conn import db
 
 # Temporarily skip Epic-4 flows due to schema transition (materials.week_id)
-pytestmark = pytest.mark.skip(
-    reason="EPIC-4 flows temporarily disabled while materials schema is updated"
-)
+pytestmark = pytest.mark.usefixtures("db_tmpdir")
 
 
 def _ensure_week(conn, week_no: int) -> None:
@@ -44,6 +43,7 @@ def _ensure_user(conn) -> str:
 
 
 def test_materials_visibility_and_dedup(db_tmpdir):
+    _apply_materials_migrations()
     week = 1
     with db() as conn:
         _ensure_week(conn, week)
@@ -86,6 +86,7 @@ def test_materials_visibility_and_dedup(db_tmpdir):
         size_bytes=saved_tch.size_bytes,
         mime="application/pdf",
         visibility="teacher_only",
+        type="m",
     )
     assert mid2 > 0
 
@@ -156,3 +157,19 @@ def test_list_weeks_sorted(db_tmpdir):
         )
     weeks = list_weeks(limit=10)
     assert weeks[:3] == [1, 2, 3]
+
+
+def _apply_materials_migrations() -> None:
+    from app.db.conn import db as _db
+
+    for m in [
+        "migrations/005_rewire_materials_weeks.sql",
+        "migrations/007_materials_versions.sql",
+    ]:
+        p = pathlib.Path(m)
+        if not p.exists():
+            continue
+        sql = p.read_text(encoding="utf-8")
+        with _db() as c:
+            c.executescript(sql)
+            c.commit()

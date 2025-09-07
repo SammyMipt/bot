@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import os
+
 from aiogram.filters import Command, CommandStart
 
 from aiogram import F, Router, types
-from app.core import callbacks, state_store
+from app.core import audit, callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
 from app.core.backup import backup_recent, trigger_backup
+from app.core.config import cfg
 from app.core.course_init import apply_course_init, parse_weeks_csv
+from app.core.files import save_blob
 from app.core.imports_epic5 import (
     E_DUPLICATE_USER,
     STUDENT_HEADERS,
@@ -15,6 +19,16 @@ from app.core.imports_epic5 import (
     get_users_summary,
     import_students_csv,
     import_teachers_csv,
+)
+from app.core.repos_epic4 import (
+    archive_active,
+    delete_archived,
+    enforce_archive_limit,
+    get_active_material,
+    insert_week_material_file,
+    insert_week_material_link,
+    list_material_versions,
+    list_weeks,
 )
 from app.db.conn import db
 
@@ -44,9 +58,31 @@ def cb(action: str, params: dict | None = None) -> str:
     return callbacks.build("own", payload, role="owner")
 
 
+def _audit_kwargs(uid: int) -> dict:
+    """Return as_* kwargs for audit if impersonation is active for uid."""
+    imp = _get_impersonation(uid)
+    if not imp:
+        return {}
+    try:
+        tg = imp.get("tg_id")
+        u = get_user_by_tg(str(tg)) if tg else None
+        if u:
+            return {"as_user_id": u.id, "as_role": u.role}
+    except Exception:
+        pass
+    return {}
+
+
+# Canonical assignment-matrix callbacks per L2: a=as; s=p|c
+def _cb_as(step: str) -> str:
+    return callbacks.build("own", {"a": "as", "s": step}, role="owner")
+
+
 def _get_impersonation(uid: int) -> dict | None:
     try:
-        _, payload = state_store.get(_imp_key(uid))
+        action, payload = state_store.get(_imp_key(uid))
+        if action != "imp_active":
+            return None
         return payload
     except Exception:
         return None
@@ -171,6 +207,10 @@ def _people_imp_ck(uid: int, kind: str) -> str:
     return f"own_imp_ck:{uid}:{kind}"
 
 
+def _assign_key(uid: int) -> str:
+    return f"own_assign:{uid}"
+
+
 def _csv_filter_excess_columns(
     content: bytes, expected_headers: list[str]
 ) -> tuple[bytes, int, bool]:
@@ -230,13 +270,47 @@ async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
 
 @router.message(CommandStart())
 async def owner_menu_on_start(m: types.Message, actor: Identity):
-    # If already registered owner → show main menu automatically
+    # Only handle owners here; others are handled by registration router
     if actor.role != "owner":
         return
     uid = _uid(m)
+    # If owner also configured as teacher → offer a role chooser per docs
+    if _owner_has_teacher_cap(actor.id):
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="👑 Владелец: главное меню",
+                        callback_data=cb("start_owner"),
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="📚 Главное меню преподавателя",
+                        callback_data=cb("start_teacher"),
+                    )
+                ],
+            ]
+        )
+        await m.answer("Выберите раздел:", reply_markup=kb)
+        return
+    # Default: open owner main menu
     _stack_reset(uid)
     banner = await _maybe_banner(uid)
     await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
+
+
+def _owner_has_teacher_cap(user_id: str) -> bool:
+    """Return True if owner has teacher capacity configured (>0)."""
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT capacity FROM users WHERE id=? LIMIT 1", (user_id,)
+            ).fetchone()
+        cap = int(row[0]) if row and row[0] is not None else 0
+        return cap > 0
+    except Exception:
+        return False
 
 
 def _is(op: str, actions: set[str]):
@@ -251,6 +325,63 @@ def _is(op: str, actions: set[str]):
             return False
 
     return _f
+
+
+def _is_as(step: str):
+    """Predicate for assignment-matrix callbacks using canonical notation a=as;s=<step>."""
+
+    def _f(cq: types.CallbackQuery) -> bool:
+        try:
+            op2, key = callbacks.parse(cq.data)
+            if op2 != "own":
+                return False
+            _, payload = state_store.get(key)
+            return payload.get("a") == "as" and payload.get("s") == step
+        except Exception:
+            return False
+
+    return _f
+
+
+# ----- Start entry choice handlers (placed after _is definition) -----
+
+
+@router.callback_query(_is("own", {"start_owner"}))
+async def own_start_owner(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    uid = _uid(cq)
+    _stack_reset(uid)
+    banner = await _maybe_banner(uid)
+    try:
+        await cq.message.edit_text(
+            banner + "Главное меню", reply_markup=_main_menu_kb()
+        )
+    except Exception:
+        await cq.message.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"start_teacher"}))
+async def own_start_teacher(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    # Show a stub page for Teacher main menu (consistent with stubs style)
+    banner = await _maybe_banner(_uid(cq))
+    msg = "📚 Главное меню преподавателя\n\n⛔ Функция не реализована"
+    try:
+        await cq.message.edit_text(msg, reply_markup=_nav_keyboard("root"))
+    except Exception:
+        await cq.message.answer(banner + msg, reply_markup=_nav_keyboard("root"))
+    await cq.answer()
 
 
 @router.callback_query(_is("own", {"home"}))
@@ -763,7 +894,7 @@ def _people_kb(impersonating: bool = False) -> types.InlineKeyboardMarkup:
         [
             types.InlineKeyboardButton(
                 text=f"Создать матрицу назначений{lock}",
-                callback_data=cb("people_matrix"),
+                callback_data=_cb_as("p"),
             )
         ],
         _nav_keyboard("people").inline_keyboard,
@@ -789,7 +920,7 @@ async def ownui_people(cq: types.CallbackQuery, actor: Identity):
     _is(
         "own",
         {
-            "people_matrix",
+            "people_matrix_stub",
         },
     )
 )
@@ -1509,16 +1640,16 @@ async def ownui_people_imp_teachers_receive(m: types.Message, actor: Identity):
 
 
 def _materials_weeks_kb(page: int = 0) -> types.InlineKeyboardMarkup:
-    # 28 per page, 7 columns
+    # 28 per page, 7 columns; read weeks from DB
+    weeks = list_weeks(limit=200)
     per_page = 28
-    total = 56  # stubbed count of weeks
-    total_pages = max(1, (total + per_page - 1) // per_page)
+    total_pages = max(1, (len(weeks) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
-    start = page * per_page + 1
-    end = min(total, start + per_page - 1)
+    start = page * per_page
+    chunk = weeks[start : start + per_page]
     rows: list[list[types.InlineKeyboardButton]] = []
     row: list[types.InlineKeyboardButton] = []
-    for n in range(start, end + 1):
+    for n in chunk:
         row.append(
             types.InlineKeyboardButton(
                 text=f"W{n}",
@@ -1638,18 +1769,75 @@ async def ownui_materials_week(cq: types.CallbackQuery, actor: Identity):
     _stack_push(_uid(cq), "materials_week", {"week": week})
 
 
+# --- Materials: helpers/state ---
+
+try:
+    from aiogram.types import BufferedInputFile  # aiogram v3
+except Exception:  # pragma: no cover
+    BufferedInputFile = None  # type: ignore
+
+
+def _mat_key(uid: int) -> str:
+    return f"own_mat:{uid}"
+
+
+def _week_id_by_no(week_no: int) -> int | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM weeks WHERE week_no=?", (week_no,)
+        ).fetchone()
+        return int(row[0]) if row else None
+
+
+def _visibility_for_type(t: str) -> str:
+    # By convention: methodical ('m') is teacher-only, others public
+    return "teacher_only" if t == "m" else "public"
+
+
+def _mat_type_label(t: str) -> tuple[str, str]:
+    mapping = {
+        "p": ("📖", "Домашние задачи и материалы для подготовки"),
+        "m": ("📘", "Методические рекомендации"),
+        "n": ("📝", "Конспект"),
+        "s": ("📊", "Презентация"),
+        "v": ("🎥", "Записи лекций"),
+    }
+    return mapping.get(t, ("📄", "Материал"))
+
+
+def _fmt_bytes(n: int | None) -> str:
+    if not n:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    s = float(n)
+    i = 0
+    while s >= 1024 and i < len(units) - 1:
+        s /= 1024.0
+        i += 1
+    return f"{s:.1f} {units[i]}"
+
+
 def _material_card_kb(
-    week: int, t: str, impersonating: bool
+    week: int, t: str, impersonating: bool, active_link: str | None = None
 ) -> types.InlineKeyboardMarkup:
+    lock = " 🔒" if impersonating else ""
+    is_video = t == "v"
+    up_text = ("🔗 Вставить ссылку" if is_video else "⬆️ Загрузить") + lock
+    second_btn_text = "🔗 Открыть ссылку" if is_video else "📂 Скачать активное"
+    second_btn_kwargs = (
+        {"url": active_link}
+        if is_video and active_link
+        else {"callback_data": cb("mat_download", {"w": week, "t": t})}
+    )
     rows = [
         [
             types.InlineKeyboardButton(
-                text="⬆️ Загрузить" + (" 🔒" if impersonating else ""),
+                text=up_text,
                 callback_data=cb("mat_upload", {"w": week, "t": t}),
             ),
             types.InlineKeyboardButton(
-                text="📂 Скачать активное",
-                callback_data=cb("mat_download", {"w": week, "t": t}),
+                text=second_btn_text,
+                **second_btn_kwargs,
             ),
         ],
         [
@@ -1682,30 +1870,428 @@ async def ownui_material_type(cq: types.CallbackQuery, actor: Identity):
     t = payload.get("t", "?")
     imp = _get_impersonation(_uid(cq))
     banner = await _maybe_banner(_uid(cq))
+    # Card header with human-friendly info
+    emoji, label = _mat_type_label(t)
+    wk_id = _week_id_by_no(week)
+    active_line = "<i>Активной версии нет</i>"
+    active_link = None
+    if wk_id is not None:
+        mat = get_active_material(wk_id, t)
+        if mat:
+            if t == "v":
+                url = mat.path or ""
+                active_link = url if url.startswith("http") else None
+                # Show clickable host/link for video
+                try:
+                    from urllib.parse import urlparse
+
+                    host = urlparse(url).netloc or "ссылка"
+                except Exception:
+                    host = "ссылка"
+                active_line = (
+                    f'<b>Активная:</b> <a href="{url}">{host}</a> · v{mat.version}'
+                )
+            else:
+                fname = os.path.basename(mat.path or "") or "—"
+                size = _fmt_bytes(int(mat.size_bytes or 0))
+                active_line = f"<b>Активная:</b> {fname} · v{mat.version} · {size}"
+    header = f"<b>{emoji} {label}</b>\n" f"<b>Неделя:</b> W{week}\n" f"{active_line}"
     await cq.message.answer(
-        banner + "Карточка материала:",
-        reply_markup=_material_card_kb(week, t, impersonating=bool(imp)),
+        banner + header,
+        reply_markup=_material_card_kb(
+            week, t, impersonating=bool(imp), active_link=active_link
+        ),
+        parse_mode="HTML",
     )
     await cq.answer()
 
 
-@router.callback_query(
-    _is(
-        "own",
-        {"mat_upload", "mat_download", "mat_history", "mat_archive", "mat_delete"},
-    )
-)
-async def ownui_material_card_stubs(cq: types.CallbackQuery, actor: Identity):
+@router.callback_query(_is("own", {"mat_upload"}))
+async def ownui_mat_upload(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
-    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
-    act = payload.get("action")
     imp = _get_impersonation(_uid(cq))
-    if imp and act in {"mat_upload", "mat_archive", "mat_delete"}:
+    if imp:
         return await cq.answer(
             "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
         )
-    await cq.answer("⛔ Функция не реализована", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    if t == "v":
+        # Expect a URL text for video links
+        state_store.put_at(
+            _mat_key(_uid(cq)),
+            "own_mat",
+            {"mode": "await_link", "w": week, "t": t},
+            ttl_sec=900,
+        )
+        banner = await _maybe_banner(_uid(cq))
+        await cq.message.answer(
+            banner + "Вставьте ссылку (http/https) на запись лекции"
+        )
+        return await cq.answer()
+    # set state to await document
+    state_store.put_at(
+        _mat_key(_uid(cq)),
+        "own_mat",
+        {"mode": "await_doc", "w": week, "t": t},
+        ttl_sec=900,
+    )
+    banner = await _maybe_banner(_uid(cq))
+    await cq.message.answer(banner + "Отправьте документ для загрузки (один файл)")
+    await cq.answer()
+
+
+def _awaits_mat_doc(m: types.Message) -> bool:
+    try:
+        act, st = state_store.get(_mat_key(m.from_user.id))
+        return act == "own_mat" and (st or {}).get("mode") == "await_doc"
+    except Exception:
+        return False
+
+
+def _awaits_mat_link(m: types.Message) -> bool:
+    try:
+        act, st = state_store.get(_mat_key(m.from_user.id))
+        return act == "own_mat" and (st or {}).get("mode") == "await_link"
+    except Exception:
+        return False
+
+
+def _is_valid_url(u: str) -> bool:
+    try:
+        if not u:
+            return False
+        u = u.strip()
+        if len(u) == 0 or len(u) > 2000:
+            return False
+        if any(ch.isspace() for ch in u):
+            return False
+        return u.startswith("http://") or u.startswith("https://")
+    except Exception:
+        return False
+
+
+@router.message(F.text, _awaits_mat_link)
+async def ownui_mat_receive_link(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    try:
+        _, st = state_store.get(_mat_key(_uid(m)))
+    except Exception:
+        return
+    week = int(st.get("w", 0))
+    t = str(st.get("t", "v"))
+    url = (m.text or "").strip()
+    if not _is_valid_url(url):
+        return await m.answer(
+            "⛔ Некорректная ссылка. Допустимы только http/https, длина ≤ 2000 символов."
+        )
+    vis = _visibility_for_type(t)
+    mid = insert_week_material_link(
+        week_no=week,
+        uploaded_by=actor.id,
+        url=url,
+        visibility=vis,
+        type=t,
+    )
+    if mid == -1:
+        await m.answer(
+            "⚠️ Ссылка идентична активной версии или уже существует — загрузка пропущена"
+        )
+        return
+    # Enforce archive limit after backup if needed
+    wk_id = _week_id_by_no(week)
+    if wk_id is not None:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(1) FROM materials WHERE week_id=? AND type=?",
+                (wk_id, t),
+            ).fetchone()
+            total = int(row[0] or 0)
+        if total > 20:
+            try:
+                trigger_backup("auto")
+            except Exception:
+                pass
+            removed = enforce_archive_limit(wk_id, t, max_versions=20)
+            if removed > 0:
+                await m.answer(f"⚠️ Удалены старые архивные версии: {removed}")
+    # Audit
+    try:
+        wk_id = _week_id_by_no(week)
+        mat = get_active_material(wk_id, t) if wk_id is not None else None
+        audit.log(
+            "OWNER_MATERIAL_UPLOAD",
+            actor.id,
+            meta={
+                "week": week,
+                "type": t,
+                "size_bytes": 0,
+                "sha256": getattr(mat, "sha256", None),
+                "version": int(getattr(mat, "version", 0) or 0),
+            },
+            **_audit_kwargs(_uid(m)),
+        )
+    except Exception:
+        pass
+    await m.answer("✅ Ссылка сохранена")
+    state_store.delete(_mat_key(_uid(m)))
+
+
+@router.message(F.document, _awaits_mat_doc)
+async def ownui_mat_receive_doc(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    # get state
+    try:
+        _, st = state_store.get(_mat_key(_uid(m)))
+    except Exception:
+        return
+    week = int(st.get("w", 0))
+    t = str(st.get("t", "p"))
+    doc = m.document
+    # Validate size limit before download
+    try:
+        fsz = int(getattr(doc, "file_size", 0) or 0)
+    except Exception:
+        fsz = 0
+    limit_bytes = int(cfg.max_file_mb) * 1024 * 1024
+    if fsz and fsz > limit_bytes:
+        return await m.answer(
+            f"⛔ E_SIZE_LIMIT — Превышен лимит: ≤{cfg.max_file_mb} МБ"
+        )
+    # Validate extension/mime by type
+    fname = (doc.file_name or "").lower()
+    ext = "." + fname.split(".")[-1] if "." in fname else ""
+    allowed_by_type = {
+        "p": {".pdf"},
+        "m": {".pdf"},
+        "n": {".pdf"},
+        "s": {".pdf", ".ppt", ".pptx"},
+    }
+    if t != "v":
+        allowed = allowed_by_type.get(t, {".pdf"})
+        if ext not in allowed:
+            return await m.answer(
+                "⛔ E_INPUT_INVALID — Недопустимый тип файла для материала"
+            )
+    # Proceed to download
+    file = await m.bot.get_file(doc.file_id)
+    b = await m.bot.download_file(file.file_path)
+    data = b.read()
+    saved = save_blob(
+        data, prefix="materials", suggested_name=doc.file_name or "material.bin"
+    )
+    vis = _visibility_for_type(t)
+    mid = insert_week_material_file(
+        week_no=week,
+        uploaded_by=actor.id,
+        path=saved.path,
+        sha256=saved.sha256,
+        size_bytes=saved.size_bytes,
+        mime=doc.mime_type,
+        visibility=vis,
+        type=t,
+        original_name=doc.file_name or None,
+    )
+    if mid == -1:
+        await m.answer(
+            "⚠️ Файл идентичен активной версии или уже существует — загрузка пропущена"
+        )
+        return
+    # Enforce archive limit after backup if needed
+    wk_id = _week_id_by_no(week)
+    if wk_id is not None:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT COUNT(1) FROM materials WHERE week_id=? AND type=?",
+                (wk_id, t),
+            ).fetchone()
+            total = int(row[0] or 0)
+        if total > 20:
+            try:
+                trigger_backup("auto")
+            except Exception:
+                pass
+            removed = enforce_archive_limit(wk_id, t, max_versions=20)
+            if removed > 0:
+                await m.answer(f"⚠️ Удалены старые архивные версии: {removed}")
+    # Audit and notify
+    try:
+        wk_id = _week_id_by_no(week)
+        mat = get_active_material(wk_id, t) if wk_id is not None else None
+        audit.log(
+            "OWNER_MATERIAL_UPLOAD",
+            actor.id,
+            meta={
+                "week": week,
+                "type": t,
+                "size_bytes": int(saved.size_bytes),
+                "sha256": saved.sha256,
+                "version": int(getattr(mat, "version", 0) or 0),
+            },
+            **_audit_kwargs(_uid(m)),
+        )
+    except Exception:
+        pass
+    await m.answer("✅ Загрузка завершена")
+    # keep state for possible next upload or clear? clear state
+    state_store.delete(_mat_key(_uid(m)))
+
+
+@router.callback_query(_is("own", {"mat_download"}))
+async def ownui_mat_download(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    mat = get_active_material(wk_id, t)
+    if not mat:
+        return await cq.answer("Нет активной версии", show_alert=True)
+    if t == "v":
+        # Send clickable link instead of a document
+        try:
+            await cq.message.answer(
+                f"🔗 Ссылка на запись лекции (W{week}):\n{mat.path}"
+            )
+            try:
+                audit.log(
+                    "OWNER_MATERIAL_DOWNLOAD",
+                    actor.id,
+                    meta={"week": week, "type": t, "version": int(mat.version or 0)},
+                    **_audit_kwargs(_uid(cq)),
+                )
+            except Exception:
+                pass
+        except Exception:
+            return await cq.answer("Не удалось отправить ссылку", show_alert=True)
+        return await cq.answer()
+    if not BufferedInputFile:
+        return await cq.answer("Нет активной версии", show_alert=True)
+    try:
+        with open(mat.path, "rb") as f:
+            data = f.read()
+        await cq.message.answer_document(
+            BufferedInputFile(
+                data, filename=(mat.path.split("/")[-1] or f"W{week}_{t}.bin")
+            ),
+            caption=f"W{week} {t}: активная версия v{mat.version}",
+        )
+        try:
+            audit.log(
+                "OWNER_MATERIAL_DOWNLOAD",
+                actor.id,
+                meta={"week": week, "type": t, "version": int(mat.version or 0)},
+                **_audit_kwargs(_uid(cq)),
+            )
+        except Exception:
+            pass
+    except Exception:
+        return await cq.answer("Не удалось подготовить файл", show_alert=True)
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"mat_history"}))
+async def ownui_mat_history(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    items = list_material_versions(wk_id, t, limit=20)
+    emoji, label = _mat_type_label(t)
+    lines = [f"<b>{emoji} История — {label}</b>", f"<b>Неделя:</b> W{week}"]
+    for it in items:
+        status = "активна" if int(it.is_active or 0) == 1 else "архив"
+        fname = os.path.basename(it.path or "") or "—"
+        size = _fmt_bytes(int(it.size_bytes or 0))
+        lines.append(f"• v{it.version} — {status} — {fname} — {size}")
+    if len(lines) == 1:
+        lines.append("• (версий нет)")
+    banner = await _maybe_banner(_uid(cq))
+    await cq.message.answer(banner + "\n".join(lines), parse_mode="HTML")
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"mat_archive"}))
+async def ownui_mat_archive(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    imp = _get_impersonation(_uid(cq))
+    if imp:
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    # audit which version is being archived
+    prev = get_active_material(wk_id, t)
+    changed = archive_active(wk_id, t)
+    await cq.answer()
+    if changed:
+        await cq.message.answer("✅ Активная версия отправлена в архив")
+        try:
+            audit.log(
+                "OWNER_MATERIAL_ARCHIVE",
+                actor.id,
+                meta={
+                    "week": week,
+                    "type": t,
+                    "version": int(getattr(prev, "version", 0) or 0),
+                },
+                **_audit_kwargs(_uid(cq)),
+            )
+        except Exception:
+            pass
+    else:
+        await cq.message.answer("Нет активной версии")
+
+
+@router.callback_query(_is("own", {"mat_delete"}))
+async def ownui_mat_delete(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    imp = _get_impersonation(_uid(cq))
+    if imp:
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    # backup then delete all archived for this type
+    try:
+        trigger_backup("auto")
+    except Exception:
+        pass
+    deleted = delete_archived(wk_id, t)
+    await cq.message.answer(f"Удалено архивных версий: {deleted}")
+    try:
+        audit.log(
+            "OWNER_MATERIAL_DELETE_ARCHIVED",
+            actor.id,
+            meta={"week": week, "type": t, "deleted": int(deleted)},
+            **_audit_kwargs(_uid(cq)),
+        )
+    except Exception:
+        pass
+    await cq.answer()
 
 
 # -------- Archive --------
@@ -1775,11 +2361,90 @@ async def ownui_arch_materials_versions(cq: types.CallbackQuery, actor: Identity
     ]
     banner = await _maybe_banner(_uid(cq))
     await cq.message.answer(
-        banner + f"Архив W{week}: версии (заглушка)",
+        banner + f"Архив W{week}: версии",
         reply_markup=types.InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await cq.answer()
     _stack_push(_uid(cq), "arch_materials_versions", {"week": week})
+
+
+@router.callback_query(_is("own", {"arch_download_all"}))
+async def ownui_arch_download_all(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("week", 0))
+    wk_id = _week_id_by_no(week)
+    if wk_id is None or BufferedInputFile is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    # Collect archived files for the week (all types)
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT path, type, version FROM materials WHERE week_id=? AND is_active=0 ORDER BY type ASC, version DESC",
+            (wk_id,),
+        ).fetchall()
+    if not rows:
+        return await cq.answer("Архив пуст", show_alert=True)
+    import io
+    import os
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for path, t, ver in rows:
+            try:
+                name = os.path.basename(path) or f"W{week}_{t}_v{ver}.bin"
+                arcname = f"W{week}/{t}/v{ver}/{name}"
+                tar.add(path, arcname=arcname)
+            except Exception:
+                continue
+    buf.seek(0)
+    await cq.message.answer_document(
+        BufferedInputFile(buf.read(), filename=f"W{week}_materials_archive.tar.gz"),
+        caption=f"Архив W{week}: {len(rows)} файлов",
+    )
+    try:
+        audit.log(
+            "OWNER_MATERIAL_ARCHIVE_DOWNLOAD_ALL",
+            actor.id,
+            meta={"week": week, "files": len(rows)},
+            **_audit_kwargs(_uid(cq)),
+        )
+    except Exception:
+        pass
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"arch_delete_all"}))
+async def ownui_arch_delete_all(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    imp = _get_impersonation(_uid(cq))
+    if imp:
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("week", 0))
+    wk_id = _week_id_by_no(week)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    # Backup then delete all archived across types for this week
+    try:
+        trigger_backup("auto")
+    except Exception:
+        pass
+    deleted = delete_archived(wk_id, None)
+    await cq.message.answer(f"Удалено архивных версий (все типы): {deleted}")
+    try:
+        audit.log(
+            "OWNER_MATERIAL_ARCHIVE_DELETE_ALL",
+            actor.id,
+            meta={"week": week, "deleted": int(deleted)},
+        )
+    except Exception:
+        pass
+    await cq.answer()
 
 
 @router.callback_query(_is("own", {"materials_week"}))
@@ -1930,9 +2595,7 @@ async def ownui_reports(cq: types.CallbackQuery, actor: Identity):
     _stack_push(_uid(cq), "reports", {})
 
 
-@router.callback_query(
-    _is("own", {"rep_audit", "rep_grades", "rep_matrix", "rep_course"})
-)
+@router.callback_query(_is("own", {"rep_audit", "rep_grades", "rep_course"}))
 async def ownui_reports_stubs(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
@@ -2008,6 +2671,14 @@ def _impersonation_active_kb(role: str) -> types.InlineKeyboardMarkup:
     rows.append(
         [
             types.InlineKeyboardButton(
+                text="🔄 Сменить пользователя",
+                callback_data=cb("imp_start"),
+            )
+        ]
+    )
+    rows.append(
+        [
+            types.InlineKeyboardButton(
                 text="↩️ Завершить имперсонизацию",
                 callback_data=cb("imp_stop"),
             )
@@ -2025,7 +2696,9 @@ async def ownui_impersonation(cq: types.CallbackQuery, actor: Identity):
     if not imp:
         banner = await _maybe_banner(_uid(cq))
         await cq.message.answer(
-            banner + "Введите tg_id для имперсонизации",
+            banner
+            + "Имперсонизация (для техподдержки). Для начала вам нужен Telegram ID реального пользователя.\n"
+            + "Нажмите «Продолжить» и введите ID.",
             reply_markup=_impersonation_idle_kb(),
         )
     else:
@@ -2047,8 +2720,14 @@ async def ownui_impersonation_start(cq: types.CallbackQuery, actor: Identity):
         ttl_sec=1800,
     )
     banner = await _maybe_banner(uid)
+    prefix = ""
+    if banner:
+        prefix = "Режим имперсонизации приостановлен до подтверждения нового ID.\n\n"
     await cq.message.answer(
-        banner + "Введите tg_id:", reply_markup=_nav_keyboard("imp")
+        prefix
+        + "Введите Telegram ID (только цифры, например 123456789).\n"
+        + "Все действия будут записаны в журнал как владелец с пометкой ‘as: пользователь’.",
+        reply_markup=_nav_keyboard("imp"),
     )
     await cq.answer()
 
@@ -2068,23 +2747,131 @@ async def ownui_impersonation_receive(m: types.Message, actor: Identity):
         return
     uid = _uid(m)
     tg = (m.text or "").strip()
+    if not tg.isdigit():
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="🔄 Ввести заново", callback_data=cb("imp_start")
+                    ),
+                    types.InlineKeyboardButton(
+                        text="⬅️ Назад", callback_data=cb("impersonation")
+                    ),
+                ]
+            ]
+        )
+        return await m.answer("⛔ Только цифры. Пример: 123456789.", reply_markup=kb)
     u = get_user_by_tg(tg)
     if not u:
-        await m.answer("❌ Пользователь не найден.")
-        return
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="🔄 Ввести заново", callback_data=cb("imp_start")
+                    ),
+                    types.InlineKeyboardButton(
+                        text="⬅️ Назад", callback_data=cb("impersonation")
+                    ),
+                ]
+            ]
+        )
+        return await m.answer(
+            "❌ Пользователь с таким ID не найден. Проверьте ID.", reply_markup=kb
+        )
+    if u.role == "owner":
+        return await m.answer("⛔ Имперсонизация владельца запрещена.")
+    # Store candidate and ask for confirmation
+    state_store.put_at(
+        _imp_key(uid),
+        "imp_setup",
+        {
+            "mode": "confirm",
+            "tg": tg,
+            "role": u.role,
+            "name": u.name,
+            "exp": _now() + 1800,
+        },
+        ttl_sec=1800,
+    )
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="✅ Начать", callback_data=cb("imp_confirm", {"tg": tg})
+                ),
+                types.InlineKeyboardButton(
+                    text="Отмена", callback_data=cb("impersonation")
+                ),
+            ]
+        ]
+    )
+    await m.answer(
+        (
+            "Профиль найден:\n"
+            f"• Имя: {u.name or '—'}\n"
+            f"• Роль: {u.role}\n"
+            f"• Telegram ID: {tg}\n\n"
+            "Начать имперсонизацию?"
+        ),
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(_is("own", {"imp_student_menu", "imp_teacher_menu"}))
+async def ownui_impersonation_menus(cq: types.CallbackQuery, actor: Identity):
+    await cq.answer("⛔ Функция не реализована", show_alert=True)
+
+
+@router.callback_query(_is("own", {"imp_confirm"}))
+async def ownui_impersonation_confirm(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        # State token expired/missing
+        try:
+            audit.log(
+                "OWNER_IMPERSONATE_START",
+                actor.id,
+                meta={"result": "error", "code": "E_IMPERSONATE_EXPIRED"},
+            )
+        except Exception:
+            pass
+        return await cq.answer("Сессия истекла. Повторите ввод.", show_alert=True)
+    tg = str(payload.get("tg", "")).strip()
+    if not tg:
+        return await cq.answer("Сессия истекла. Повторите ввод.", show_alert=True)
+    uid = _uid(cq)
+    u = get_user_by_tg(tg)
+    if not u or u.role == "owner":
+        try:
+            audit.log(
+                "OWNER_IMPERSONATE_START",
+                actor.id,
+                meta={"result": "error", "code": "E_IMPERSONATE_FORBIDDEN"},
+            )
+        except Exception:
+            pass
+        return await cq.answer("⛔ Недоступно для этого пользователя", show_alert=True)
+    # Activate session
     state_store.put_at(
         _imp_key(uid),
         "imp_active",
         {"tg_id": tg, "role": u.role, "name": u.name, "exp": _now() + 1800},
         ttl_sec=1800,
     )
+    try:
+        audit.log(
+            "OWNER_IMPERSONATE_START",
+            actor.id,
+            meta={"target_tg_id": tg, "target_role": u.role},
+        )
+    except Exception:
+        pass
     banner = await _maybe_banner(uid)
-    await m.answer(banner, reply_markup=_impersonation_active_kb(u.role))
-
-
-@router.callback_query(_is("own", {"imp_student_menu", "imp_teacher_menu"}))
-async def ownui_impersonation_menus(cq: types.CallbackQuery, actor: Identity):
-    await cq.answer("⛔ Функция не реализована", show_alert=True)
+    await cq.message.answer(banner, reply_markup=_impersonation_active_kb(u.role))
+    await cq.answer()
 
 
 @router.callback_query(_is("own", {"imp_stop"}))
@@ -2093,8 +2880,392 @@ async def ownui_impersonation_stop(cq: types.CallbackQuery, actor: Identity):
         state_store.delete(_imp_key(_uid(cq)))
     except Exception:
         pass
+    # Audit stop of impersonation (idempotent)
+    try:
+        audit.log("OWNER_IMPERSONATE_STOP", actor.id)
+    except Exception:
+        pass
     banner = await _maybe_banner(_uid(cq))
     await cq.message.answer(
         banner + "Имперсонизация завершена.", reply_markup=_nav_keyboard("imp")
     )
+    await cq.answer()
+
+
+# -------- Assignment matrix (preview/commit) --------
+
+
+@router.callback_query(_is_as("p"))
+async def ownui_people_matrix_preview(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    # Extract to consume token and check impersonation
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    # Build preview
+    import uuid
+
+    with db() as conn:
+        weeks = [
+            r[0]
+            for r in conn.execute(
+                "SELECT week_no FROM weeks ORDER BY week_no ASC"
+            ).fetchall()
+        ]
+        students = conn.execute(
+            (
+                "SELECT id, COALESCE(name,''), COALESCE(group_name,'') "
+                "FROM users "
+                "WHERE role='student' AND (is_active IS NULL OR is_active=1) "
+                "ORDER BY COALESCE(group_name,''), COALESCE(name,''), id"
+            )
+        ).fetchall()
+        # Teachers include classic teachers and owner acting as teacher (capacity > 0)
+        teachers = conn.execute(
+            (
+                "SELECT id, COALESCE(name,''), COALESCE(capacity,0) FROM users "
+                "WHERE (role='teacher' OR (role='owner' AND tg_id=?)) "
+                "AND (is_active IS NULL OR is_active=1) AND COALESCE(capacity,0) > 0 "
+                "ORDER BY COALESCE(name,''), id"
+            ),
+            (actor.tg_id,),
+        ).fetchall()
+    if not weeks:
+        return await cq.answer("⛔ Недоступно: нет недель курса", show_alert=True)
+    if not students:
+        return await cq.answer("⛔ Недоступно: нет студентов", show_alert=True)
+    if not teachers:
+        return await cq.answer(
+            "⛔ Недоступно: нет преподавателей с положительным лимитом", show_alert=True
+        )
+    total_cap = sum(int(t[2]) for t in teachers)
+    if total_cap < len(students):
+        try:
+            audit.log(
+                "OWNER_ASSIGN_PREVIEW",
+                actor.id,
+                request_id=str(uuid.uuid4()),
+                meta={
+                    "error": "INSUFFICIENT_CAPACITY",
+                    "teachers": len(teachers),
+                    "weeks": len(weeks),
+                    "students": len(students),
+                    "total_capacity": total_cap,
+                },
+            )
+        except Exception:
+            pass
+        return await cq.answer(
+            f"⛔ Недостаточная суммарная вместимость преподавателей: {total_cap} < {len(students)}",
+            show_alert=True,
+        )
+
+    # Round-robin per week with rotation
+    def _assign_for_week(week_index: int):
+        remaining = {t[0]: int(t[2]) for t in teachers}
+        order = [t[0] for t in teachers]
+        pos = week_index % len(order)
+        result = []  # list of (student_id, teacher_id)
+        for sid, _, _ in students:
+            tried = 0
+            while tried < len(order) and remaining[order[pos]] <= 0:
+                pos = (pos + 1) % len(order)
+                tried += 1
+            if tried >= len(order):
+                break
+            tid = order[pos]
+            result.append((sid, tid))
+            remaining[tid] -= 1
+            pos = (pos + 1) % len(order)
+        return result
+
+    matrix = []  # list of dicts: {week_no, student_id, teacher_id}
+    for wi, w in enumerate(weeks):
+        pairs = _assign_for_week(wi)
+        for sid, tid in pairs:
+            matrix.append({"week_no": int(w), "student_id": sid, "teacher_id": tid})
+    # Save to StateStore for commit
+    req_id = str(uuid.uuid4())
+    state_store.put_at(
+        _assign_key(uid),
+        "assign_preview",
+        {
+            "req": req_id,
+            "weeks": weeks,
+            "students": [s[0] for s in students],
+            "teachers": [t[0] for t in teachers],
+            "matrix": matrix,
+        },
+        ttl_sec=900,
+    )
+    # Audit preview
+    try:
+        audit.log(
+            "OWNER_ASSIGN_PREVIEW",
+            actor.id,
+            request_id=req_id,
+            meta={
+                "strategy": "round_robin",
+                "teachers": len(teachers),
+                "weeks": len(weeks),
+                "students": len(students),
+            },
+        )
+    except Exception:
+        pass
+    # Render preview summary
+    teacher_lines = [
+        f"— {t[1] or '(без имени)'} (cap {int(t[2])})" for t in teachers[:10]
+    ]
+    more_teachers = "\n…" if len(teachers) > 10 else ""
+    lines = [
+        "📋 Предпросмотр матрицы назначений",
+        f"Студентов: {len(students)}; Преподавателей: {len(teachers)}; Недель: {len(weeks)}",
+        "Преподаватели:",
+        *teacher_lines,
+        more_teachers,
+        "\nПодтвердить создание матрицы?",
+    ]
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="✅ Подтвердить", callback_data=_cb_as("c")
+                ),
+                types.InlineKeyboardButton(text="Отмена", callback_data=cb("people")),
+            ],
+            _nav_keyboard("people").inline_keyboard[0],
+        ]
+    )
+    banner = await _maybe_banner(uid)
+    try:
+        await cq.message.edit_text(
+            banner + "\n".join([x for x in lines if x]), reply_markup=kb
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + "\n".join([x for x in lines if x]), reply_markup=kb
+        )
+    await cq.answer()
+
+
+@router.callback_query(_is_as("c"))
+async def ownui_people_matrix_commit(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    # one-shot token consume
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    try:
+        action, st = state_store.get(_assign_key(uid))
+    except Exception:
+        action, st = None, None
+    if action != "assign_preview" or not st:
+        return await cq.answer("Сессия истекла, повторите шаг", show_alert=True)
+    matrix = st.get("matrix") or []
+    req_id = st.get("req")
+    import time
+
+    now = int(time.time())
+    # Revalidate snapshot to avoid FK slips
+
+    try:
+        with db() as conn:
+            weeks_cur = {
+                int(r[0]) for r in conn.execute("SELECT week_no FROM weeks").fetchall()
+            }
+            students_cur = {
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT id FROM users WHERE role='student' AND (is_active IS NULL OR is_active=1)"
+                ).fetchall()
+            }
+            teachers_rows = conn.execute(
+                (
+                    "SELECT id, COALESCE(capacity,0) FROM users "
+                    "WHERE (role='teacher' OR (role='owner' AND tg_id=?)) "
+                    "AND (is_active IS NULL OR is_active=1) AND COALESCE(capacity,0) > 0"
+                ),
+                (actor.tg_id,),
+            ).fetchall()
+            teachers_cur = {str(r[0]) for r in teachers_rows}
+            total_cap = sum(int(r[1]) for r in teachers_rows)
+        # Validate references and capacity
+        if total_cap < len(st.get("students", [])):
+            try:
+                audit.log(
+                    "OWNER_ASSIGN_COMMIT",
+                    actor.id,
+                    request_id=req_id,
+                    meta={"error": "INSUFFICIENT_CAPACITY"},
+                )
+            except Exception:
+                pass
+            return await cq.answer(
+                "⛔ Недостаточная суммарная вместимость преподавателей. Пересоздайте превью.",
+                show_alert=True,
+            )
+        for row in matrix:
+            if (
+                int(row.get("week_no", 0)) not in weeks_cur
+                or str(row.get("student_id")) not in students_cur
+                or str(row.get("teacher_id")) not in teachers_cur
+            ):
+                try:
+                    audit.log(
+                        "OWNER_ASSIGN_COMMIT",
+                        actor.id,
+                        request_id=req_id,
+                        meta={"error": "E_STATE_INVALID_CHANGED"},
+                    )
+                except Exception:
+                    pass
+                return await cq.answer(
+                    "⛔ Данные изменились. Создайте превью заново.", show_alert=True
+                )
+    except Exception:
+        # Best-effort: if revalidation fails, continue to DB write guarded by FK
+        pass
+    try:
+        with db() as conn:
+            conn.execute("BEGIN")
+            sql = (
+                "INSERT INTO teacher_student_assignments(week_no, teacher_id, student_id, created_at_utc) "
+                "VALUES(?,?,?,?) "
+                "ON CONFLICT(week_no, student_id) DO UPDATE SET teacher_id=excluded.teacher_id, created_at_utc=excluded.created_at_utc"
+            )
+            for row in matrix:
+                conn.execute(
+                    sql,
+                    (
+                        int(row["week_no"]),
+                        str(row["teacher_id"]),
+                        str(row["student_id"]),
+                        now,
+                    ),
+                )
+            conn.commit()
+    except Exception as e:
+        # audit failure
+        try:
+            audit.log(
+                "OWNER_ASSIGN_COMMIT",
+                actor.id,
+                request_id=req_id,
+                meta={"error": str(e)},
+            )
+        except Exception:
+            pass
+        return await cq.answer("⛔ Не удалось применить матрицу", show_alert=True)
+    # Audit commit
+    try:
+        audit.log(
+            "OWNER_ASSIGN_COMMIT",
+            actor.id,
+            request_id=req_id,
+            meta={"rows": len(matrix)},
+        )
+    except Exception:
+        pass
+    # Cleanup state
+    try:
+        state_store.delete(_assign_key(uid))
+    except Exception:
+        pass
+    banner = await _maybe_banner(uid)
+    await cq.message.answer(
+        banner + "✅ Матрица создана", reply_markup=_nav_keyboard("people")
+    )
+    await cq.answer()
+
+
+# -------- Reports: assignment matrix export --------
+
+
+@router.callback_query(_is("own", {"rep_matrix"}))
+async def ownui_reports_matrix(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    # gасим токен
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    if not backup_recent():
+        return await cq.answer("⛔ Недоступно: нет свежего бэкапа", show_alert=True)
+    # Build wide CSV: student, group, Wxx...
+    import csv
+    import io
+    import time as _t
+
+    with db() as conn:
+        weeks = [
+            r[0]
+            for r in conn.execute(
+                "SELECT week_no FROM weeks ORDER BY week_no ASC"
+            ).fetchall()
+        ]
+        students = conn.execute(
+            (
+                "SELECT id, COALESCE(name,''), COALESCE(group_name,'') "
+                "FROM users "
+                "WHERE role='student' AND (is_active IS NULL OR is_active=1) "
+                "ORDER BY COALESCE(group_name,''), COALESCE(name,''), id"
+            )
+        ).fetchall()
+        # Build map (student_id, week_no) -> teacher name (works for owner-as-teacher too)
+        rows = conn.execute(
+            (
+                "SELECT tsa.student_id, tsa.week_no, COALESCE(u.name,'') "
+                "FROM teacher_student_assignments tsa "
+                "JOIN users u ON u.id = tsa.teacher_id"
+            )
+        ).fetchall()
+    # Explicit error if matrix does not exist (no assignments at all)
+    if not rows:
+        return await cq.answer("⛔ Матрица назначений не создана", show_alert=True)
+    m = {(str(r[0]), int(r[1])): (r[2] or "") for r in rows}
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    header = ["student", "group"] + [f"W{int(x):02d}" for x in weeks]
+    w.writerow(header)
+    for sid, sname, sgroup in students:
+        row = [sname or "", sgroup or ""]
+        for wk in weeks:
+            row.append(m.get((str(sid), int(wk)), ""))
+        w.writerow(row)
+    data = buf.getvalue().encode("utf-8")
+    ts = _t.strftime("%Y%m%d_%H%M%S", _t.gmtime())
+    try:
+        await cq.message.answer_document(
+            types.BufferedInputFile(data, filename=f"assignment_matrix_{ts}.csv"),
+            caption="Экспорт assignment matrix (CSV)",
+        )
+        try:
+            audit.log(
+                "OWNER_REPORT_EXPORT",
+                actor.id,
+                meta={"type": "assignment_matrix_csv"},
+                **_audit_kwargs(_uid(cq)),
+            )
+        except Exception:
+            pass
+    except Exception:
+        return await cq.answer(
+            "⛔ Не удалось сформировать/отправить экспорт", show_alert=True
+        )
     await cq.answer()

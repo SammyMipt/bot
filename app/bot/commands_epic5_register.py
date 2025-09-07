@@ -81,7 +81,8 @@ def _retry_cancel_kb(role: str) -> types.InlineKeyboardMarkup:
 
 
 def _eff_tg_id(raw_id: int) -> str:
-    return cfg.auth_tg_override or str(raw_id)
+    # AUTH_TG_OVERRIDE removed: always use the real Telegram id
+    return str(raw_id)
 
 
 @router.message(CommandStart())

@@ -23,7 +23,8 @@ def _op(op: str):
 
 
 def _eff_tg_id(raw_id: int) -> str:
-    return cfg.auth_tg_override or str(raw_id)
+    # AUTH_TG_OVERRIDE removed: always use the real Telegram id
+    return str(raw_id)
 
 
 def _start_kb(role: str) -> types.InlineKeyboardMarkup:
@@ -217,7 +218,7 @@ async def owner_capacity_pick(cq: types.CallbackQuery, actor: Identity):
 @router.callback_query(_op("owntg"))
 async def owner_name_use_tg(cq: types.CallbackQuery, actor: Identity):
     callbacks.extract(cq.data)
-    tg = cfg.auth_tg_override or str(cq.from_user.id)
+    tg = str(cq.from_user.id)
     name = cq.from_user.full_name or ""
     if not name.strip():
         await cq.message.answer(
@@ -255,7 +256,7 @@ async def owner_name_set(m: types.Message, actor: Identity):
             "Имя не может быть пустым. Попробуйте ещё раз или используйте имя из Telegram."
         )
         return
-    tg = cfg.auth_tg_override or str(m.from_user.id)
+    tg = str(m.from_user.id)
     if repo_users.set_name_by_tg(tg, name):
         state_store.delete(_own_key(m.from_user.id))
         await m.answer(f"✅ Имя установлено: {name}")
