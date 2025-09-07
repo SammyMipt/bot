@@ -16,3 +16,16 @@ class StateRoleMismatch(StateError):
 
 class EmailAlreadyBound(Exception):
     code = "E_EMAIL_ALREADY_BOUND"
+
+
+# Impersonation errors (per L3_Owner v0.11)
+class ImpersonateForbidden(Exception):
+    code = "E_IMPERSONATE_FORBIDDEN"
+
+
+class ImpersonateActive(Exception):
+    code = "E_IMPERSONATE_ACTIVE"
+
+
+class ImpersonateExpired(Exception):
+    code = "E_IMPERSONATE_EXPIRED"

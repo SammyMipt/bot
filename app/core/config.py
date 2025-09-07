@@ -18,7 +18,6 @@ class Config:
     sqlite_path: str = os.getenv("SQLITE_PATH", "./var/app.db")
     max_file_mb: int = int(os.getenv("MAX_FILE_MB", "20"))
     course_secret: str = os.getenv("COURSE_SECRET", "")
-    auth_tg_override: str = os.getenv("AUTH_TG_OVERRIDE", "")
     telegram_owner_ids_raw: str = os.getenv("OWNERS_TELEGRAM_ID", "")
 
     @property

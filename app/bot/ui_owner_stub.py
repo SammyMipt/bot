@@ -58,6 +58,21 @@ def cb(action: str, params: dict | None = None) -> str:
     return callbacks.build("own", payload, role="owner")
 
 
+def _audit_kwargs(uid: int) -> dict:
+    """Return as_* kwargs for audit if impersonation is active for uid."""
+    imp = _get_impersonation(uid)
+    if not imp:
+        return {}
+    try:
+        tg = imp.get("tg_id")
+        u = get_user_by_tg(str(tg)) if tg else None
+        if u:
+            return {"as_user_id": u.id, "as_role": u.role}
+    except Exception:
+        pass
+    return {}
+
+
 # Canonical assignment-matrix callbacks per L2: a=as; s=p|c
 def _cb_as(step: str) -> str:
     return callbacks.build("own", {"a": "as", "s": step}, role="owner")
@@ -65,7 +80,9 @@ def _cb_as(step: str) -> str:
 
 def _get_impersonation(uid: int) -> dict | None:
     try:
-        _, payload = state_store.get(_imp_key(uid))
+        action, payload = state_store.get(_imp_key(uid))
+        if action != "imp_active":
+            return None
         return payload
     except Exception:
         return None
@@ -1940,6 +1957,7 @@ async def ownui_mat_receive_link(m: types.Message, actor: Identity):
                 "sha256": getattr(mat, "sha256", None),
                 "version": int(getattr(mat, "version", 0) or 0),
             },
+            **_audit_kwargs(_uid(m)),
         )
     except Exception:
         pass
@@ -2039,6 +2057,7 @@ async def ownui_mat_receive_doc(m: types.Message, actor: Identity):
                 "sha256": saved.sha256,
                 "version": int(getattr(mat, "version", 0) or 0),
             },
+            **_audit_kwargs(_uid(m)),
         )
     except Exception:
         pass
@@ -2071,6 +2090,7 @@ async def ownui_mat_download(cq: types.CallbackQuery, actor: Identity):
                     "OWNER_MATERIAL_DOWNLOAD",
                     actor.id,
                     meta={"week": week, "type": t, "version": int(mat.version or 0)},
+                    **_audit_kwargs(_uid(cq)),
                 )
             except Exception:
                 pass
@@ -2093,6 +2113,7 @@ async def ownui_mat_download(cq: types.CallbackQuery, actor: Identity):
                 "OWNER_MATERIAL_DOWNLOAD",
                 actor.id,
                 meta={"week": week, "type": t, "version": int(mat.version or 0)},
+                **_audit_kwargs(_uid(cq)),
             )
         except Exception:
             pass
@@ -2156,6 +2177,7 @@ async def ownui_mat_archive(cq: types.CallbackQuery, actor: Identity):
                     "type": t,
                     "version": int(getattr(prev, "version", 0) or 0),
                 },
+                **_audit_kwargs(_uid(cq)),
             )
         except Exception:
             pass
@@ -2190,6 +2212,7 @@ async def ownui_mat_delete(cq: types.CallbackQuery, actor: Identity):
             "OWNER_MATERIAL_DELETE_ARCHIVED",
             actor.id,
             meta={"week": week, "type": t, "deleted": int(deleted)},
+            **_audit_kwargs(_uid(cq)),
         )
     except Exception:
         pass
@@ -2310,6 +2333,7 @@ async def ownui_arch_download_all(cq: types.CallbackQuery, actor: Identity):
             "OWNER_MATERIAL_ARCHIVE_DOWNLOAD_ALL",
             actor.id,
             meta={"week": week, "files": len(rows)},
+            **_audit_kwargs(_uid(cq)),
         )
     except Exception:
         pass
@@ -2572,6 +2596,14 @@ def _impersonation_active_kb(role: str) -> types.InlineKeyboardMarkup:
     rows.append(
         [
             types.InlineKeyboardButton(
+                text="🔄 Сменить пользователя",
+                callback_data=cb("imp_start"),
+            )
+        ]
+    )
+    rows.append(
+        [
+            types.InlineKeyboardButton(
                 text="↩️ Завершить имперсонизацию",
                 callback_data=cb("imp_stop"),
             )
@@ -2589,7 +2621,9 @@ async def ownui_impersonation(cq: types.CallbackQuery, actor: Identity):
     if not imp:
         banner = await _maybe_banner(_uid(cq))
         await cq.message.answer(
-            banner + "Введите tg_id для имперсонизации",
+            banner
+            + "Имперсонизация (для техподдержки). Для начала вам нужен Telegram ID реального пользователя.\n"
+            + "Нажмите «Продолжить» и введите ID.",
             reply_markup=_impersonation_idle_kb(),
         )
     else:
@@ -2611,8 +2645,14 @@ async def ownui_impersonation_start(cq: types.CallbackQuery, actor: Identity):
         ttl_sec=1800,
     )
     banner = await _maybe_banner(uid)
+    prefix = ""
+    if banner:
+        prefix = "Режим имперсонизации приостановлен до подтверждения нового ID.\n\n"
     await cq.message.answer(
-        banner + "Введите tg_id:", reply_markup=_nav_keyboard("imp")
+        prefix
+        + "Введите Telegram ID (только цифры, например 123456789).\n"
+        + "Все действия будут записаны в журнал как владелец с пометкой ‘as: пользователь’.",
+        reply_markup=_nav_keyboard("imp"),
     )
     await cq.answer()
 
@@ -2632,18 +2672,74 @@ async def ownui_impersonation_receive(m: types.Message, actor: Identity):
         return
     uid = _uid(m)
     tg = (m.text or "").strip()
+    if not tg.isdigit():
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="🔄 Ввести заново", callback_data=cb("imp_start")
+                    ),
+                    types.InlineKeyboardButton(
+                        text="⬅️ Назад", callback_data=cb("impersonation")
+                    ),
+                ]
+            ]
+        )
+        return await m.answer("⛔ Только цифры. Пример: 123456789.", reply_markup=kb)
     u = get_user_by_tg(tg)
     if not u:
-        await m.answer("❌ Пользователь не найден.")
-        return
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="🔄 Ввести заново", callback_data=cb("imp_start")
+                    ),
+                    types.InlineKeyboardButton(
+                        text="⬅️ Назад", callback_data=cb("impersonation")
+                    ),
+                ]
+            ]
+        )
+        return await m.answer(
+            "❌ Пользователь с таким ID не найден. Проверьте ID.", reply_markup=kb
+        )
+    if u.role == "owner":
+        return await m.answer("⛔ Имперсонизация владельца запрещена.")
+    # Store candidate and ask for confirmation
     state_store.put_at(
         _imp_key(uid),
-        "imp_active",
-        {"tg_id": tg, "role": u.role, "name": u.name, "exp": _now() + 1800},
+        "imp_setup",
+        {
+            "mode": "confirm",
+            "tg": tg,
+            "role": u.role,
+            "name": u.name,
+            "exp": _now() + 1800,
+        },
         ttl_sec=1800,
     )
-    banner = await _maybe_banner(uid)
-    await m.answer(banner, reply_markup=_impersonation_active_kb(u.role))
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="✅ Начать", callback_data=cb("imp_confirm", {"tg": tg})
+                ),
+                types.InlineKeyboardButton(
+                    text="Отмена", callback_data=cb("impersonation")
+                ),
+            ]
+        ]
+    )
+    await m.answer(
+        (
+            "Профиль найден:\n"
+            f"• Имя: {u.name or '—'}\n"
+            f"• Роль: {u.role}\n"
+            f"• Telegram ID: {tg}\n\n"
+            "Начать имперсонизацию?"
+        ),
+        reply_markup=kb,
+    )
 
 
 @router.callback_query(_is("own", {"imp_student_menu", "imp_teacher_menu"}))
@@ -2651,10 +2747,67 @@ async def ownui_impersonation_menus(cq: types.CallbackQuery, actor: Identity):
     await cq.answer("⛔ Функция не реализована", show_alert=True)
 
 
+@router.callback_query(_is("own", {"imp_confirm"}))
+async def ownui_impersonation_confirm(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        # State token expired/missing
+        try:
+            audit.log(
+                "OWNER_IMPERSONATE_START",
+                actor.id,
+                meta={"result": "error", "code": "E_IMPERSONATE_EXPIRED"},
+            )
+        except Exception:
+            pass
+        return await cq.answer("Сессия истекла. Повторите ввод.", show_alert=True)
+    tg = str(payload.get("tg", "")).strip()
+    if not tg:
+        return await cq.answer("Сессия истекла. Повторите ввод.", show_alert=True)
+    uid = _uid(cq)
+    u = get_user_by_tg(tg)
+    if not u or u.role == "owner":
+        try:
+            audit.log(
+                "OWNER_IMPERSONATE_START",
+                actor.id,
+                meta={"result": "error", "code": "E_IMPERSONATE_FORBIDDEN"},
+            )
+        except Exception:
+            pass
+        return await cq.answer("⛔ Недоступно для этого пользователя", show_alert=True)
+    # Activate session
+    state_store.put_at(
+        _imp_key(uid),
+        "imp_active",
+        {"tg_id": tg, "role": u.role, "name": u.name, "exp": _now() + 1800},
+        ttl_sec=1800,
+    )
+    try:
+        audit.log(
+            "OWNER_IMPERSONATE_START",
+            actor.id,
+            meta={"target_tg_id": tg, "target_role": u.role},
+        )
+    except Exception:
+        pass
+    banner = await _maybe_banner(uid)
+    await cq.message.answer(banner, reply_markup=_impersonation_active_kb(u.role))
+    await cq.answer()
+
+
 @router.callback_query(_is("own", {"imp_stop"}))
 async def ownui_impersonation_stop(cq: types.CallbackQuery, actor: Identity):
     try:
         state_store.delete(_imp_key(_uid(cq)))
+    except Exception:
+        pass
+    # Audit stop of impersonation (idempotent)
+    try:
+        audit.log("OWNER_IMPERSONATE_STOP", actor.id)
     except Exception:
         pass
     banner = await _maybe_banner(_uid(cq))
@@ -3029,7 +3182,10 @@ async def ownui_reports_matrix(cq: types.CallbackQuery, actor: Identity):
         )
         try:
             audit.log(
-                "OWNER_REPORT_EXPORT", actor.id, meta={"type": "assignment_matrix_csv"}
+                "OWNER_REPORT_EXPORT",
+                actor.id,
+                meta={"type": "assignment_matrix_csv"},
+                **_audit_kwargs(_uid(cq)),
             )
         except Exception:
             pass
