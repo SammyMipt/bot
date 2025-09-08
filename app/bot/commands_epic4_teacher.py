@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from aiogram import Router, types
 from aiogram.filters import Command
 
-from aiogram import Router, types
 from app.core import callbacks, state_store
 from app.core.auth import Identity
 from app.core.repos_epic4 import (

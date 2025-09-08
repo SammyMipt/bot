@@ -1,9 +1,9 @@
 import logging
 
+from aiogram import Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
-from aiogram import Router
 from app.core import auth
 from app.core.roles import OWNER
 from app.db.conn import db

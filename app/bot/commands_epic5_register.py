@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 import re
 
+from aiogram import F, Router, types
 from aiogram.filters import CommandStart
 
-from aiogram import F, Router, types
 from app.core import callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
 from app.core.config import cfg

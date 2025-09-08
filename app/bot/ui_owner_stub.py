@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 
+from aiogram import F, Router, types
 from aiogram.filters import Command, CommandStart
 
-from aiogram import F, Router, types
 from app.core import audit, callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
 from app.core.backup import backup_recent, trigger_backup

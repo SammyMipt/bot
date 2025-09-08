@@ -1,9 +1,9 @@
 import asyncio
 import logging
 
+from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 
-from aiogram import Bot, Dispatcher
 from app.bot.commands_epic4_owner import router as epic4_owner_router
 from app.bot.commands_epic4_student import router as epic4_student_router
 from app.bot.commands_epic4_teacher import router as epic4_teacher_router

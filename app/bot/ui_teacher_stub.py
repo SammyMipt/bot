@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-from aiogram.filters import Command
+import os
 
 from aiogram import F, Router, types
+from aiogram.filters import Command
+
 from app.core import callbacks, state_store
 from app.core.auth import Identity
-from app.core.repos_epic4 import list_weeks
+from app.core.repos_epic4 import get_active_material, list_weeks_with_titles
+from app.db.conn import db
+
+try:
+    from aiogram.types import BufferedInputFile
+except Exception:  # pragma: no cover
+    BufferedInputFile = None  # type: ignore
 
 router = Router(name="ui.teacher.stub")
 
@@ -149,6 +157,56 @@ def _main_menu_kb(role: str, uid: int) -> types.InlineKeyboardMarkup:
                 )
             ]
         )
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _week_id_by_no(week_no: int) -> int | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM weeks WHERE week_no=?", (week_no,)
+        ).fetchone()
+        return int(row[0]) if row else None
+
+
+def _week_title(week_no: int) -> str:
+    weeks = dict(list_weeks_with_titles(limit=200))
+    return weeks.get(week_no, "")
+
+
+def _materials_types_kb(week: int, role: str) -> types.InlineKeyboardMarkup:
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text="📄 Материалы недели",
+                callback_data=cb("materials_send", {"week": week, "t": "p"}, role=role),
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="📘 Материалы для преподавателя",
+                callback_data=cb("materials_send", {"week": week, "t": "m"}, role=role),
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="📚 Конспект",
+                callback_data=cb("materials_send", {"week": week, "t": "n"}, role=role),
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="📊 Презентация",
+                callback_data=cb("materials_send", {"week": week, "t": "s"}, role=role),
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="🎥 Запись лекции",
+                callback_data=cb("materials_send", {"week": week, "t": "v"}, role=role),
+            )
+        ],
+        _nav_keyboard().inline_keyboard[0],
+    ]
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -785,27 +843,26 @@ async def tui_presets_create_next(cq: types.CallbackQuery, actor: Identity):
 
 
 def _weeks_keyboard(role: str, page: int = 0) -> types.InlineKeyboardMarkup:
-    weeks = list_weeks(limit=200)
-    per_page = 28
-    row_size = 7
+    weeks = list_weeks_with_titles(limit=200)
+    per_page = 8
     total_pages = max(1, (len(weeks) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     start = page * per_page
     chunk = weeks[start : start + per_page]
 
     rows: list[list[types.InlineKeyboardButton]] = []
-    row: list[types.InlineKeyboardButton] = []
-    for n in chunk:
-        row.append(
-            types.InlineKeyboardButton(
-                text=f"W{n}", callback_data=cb("materials_week", {"week": n}, role=role)
-            )
+    for n, title in chunk:
+        label = f"📘 Неделя {n}"
+        if title:
+            label += f". {title}"
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb("materials_week", {"week": n}, role=role),
+                )
+            ]
         )
-        if len(row) == row_size:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
 
     if total_pages > 1:
         nav: list[types.InlineKeyboardButton] = []
@@ -838,12 +895,12 @@ async def tui_materials(cq: types.CallbackQuery, actor: Identity):
     except Exception:
         await cq.answer("⛔ Сессия истекла. Начните заново.", show_alert=True)
         return await tui_home(cq, actor)
-    text = "Методические материалы. Выберите неделю:"
+    text = "📚 <b>Методические материалы</b>\nВыберите неделю:"
     kb = _weeks_keyboard(actor.role, page=0)
     try:
-        await cq.message.edit_text(text, reply_markup=kb)
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
-        await cq.message.answer(text, reply_markup=kb)
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await cq.answer()
     _stack_push(_uid(cq), "materials", {})
 
@@ -860,8 +917,9 @@ async def tui_materials_page(cq: types.CallbackQuery, actor: Identity):
         )
     except Exception:
         await cq.message.answer(
-            "Методические материалы. Выберите неделю:",
+            "📚 <b>Методические материалы</b>\nВыберите неделю:",
             reply_markup=_weeks_keyboard(actor.role, page=page),
+            parse_mode="HTML",
         )
     await cq.answer()
 
@@ -872,16 +930,75 @@ async def tui_materials_week(cq: types.CallbackQuery, actor: Identity):
         return await cq.answer("Нет прав", show_alert=True)
     _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     week_no = int(payload.get("week", 0))
-    text = f"Неделя W{week_no}. Заглушка: просмотр материалов не реализован."
-    kb = types.InlineKeyboardMarkup(
-        inline_keyboard=[_nav_keyboard().inline_keyboard[0]]
-    )
+    title = _week_title(week_no)
+    if title:
+        text = f"📚 <b>Неделя {week_no}. {title}</b>\nВыберите материал:"
+    else:
+        text = f"📚 <b>Неделя {week_no}</b>\nВыберите материал:"
+    kb = _materials_types_kb(week_no, actor.role)
     try:
-        await cq.message.edit_text(text, reply_markup=kb)
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
-        await cq.message.answer(text, reply_markup=kb)
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await cq.answer()
     _stack_push(_uid(cq), "materials_week", {"week": week_no})
+
+
+@router.callback_query(_is("t", {"materials_send"}))
+async def tui_materials_send(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week_no = int(payload.get("week", 0))
+    t = payload.get("t", "p")
+    wk_id = _week_id_by_no(week_no)
+    if wk_id is None:
+        return await cq.answer("Неделя не найдена", show_alert=True)
+    mat = get_active_material(wk_id, t)
+    if not mat:
+        return await cq.answer("Нет активной версии", show_alert=True)
+    title = _week_title(week_no)
+    labels = {
+        "p": ("📄", "Материалы недели"),
+        "m": ("📘", "Материалы для преподавателя"),
+        "n": ("📚", "Конспект"),
+        "s": ("📊", "Презентация"),
+        "v": ("🎥", "Запись лекции"),
+    }
+    emoji, name = labels.get(t, ("📄", "Материал"))
+    if t == "v":
+        try:
+            msg = f"{emoji} <b>Неделя {week_no}"
+            if title:
+                msg += f". {title}"
+            msg += f'.</b> <a href="{mat.path}">{name}</a>'
+            await cq.message.answer(
+                msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            return await cq.answer("Не удалось отправить ссылку", show_alert=True)
+        await cq.answer("✅ Ссылка отправлена")
+        return
+    if not BufferedInputFile:
+        return await cq.answer("Нет активной версии", show_alert=True)
+    try:
+        with open(mat.path, "rb") as f:
+            data = f.read()
+        fname = os.path.basename(mat.path) or f"week{week_no}_{t}.bin"
+        caption = f"{emoji} <b>Неделя {week_no}"
+        if title:
+            caption += f". {title}"
+        caption += f".</b> {name}."
+        await cq.message.answer_document(
+            BufferedInputFile(data, filename=fname),
+            caption=caption,
+            parse_mode="HTML",
+        )
+    except Exception:
+        return await cq.answer("Не удалось подготовить файл", show_alert=True)
+    await cq.answer("✅ Файл отправлен")
 
 
 # ------- Check work -------
