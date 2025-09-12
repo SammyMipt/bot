@@ -167,6 +167,11 @@ def _main_menu_kb(role: str, uid: int) -> types.InlineKeyboardMarkup:
                 text="📝 Проверка работ", callback_data=cb("checkwork", role=role)
             )
         ],
+        [
+            types.InlineKeyboardButton(
+                text="⚙️ Настройки", callback_data=cb("settings", role=role)
+            )
+        ],
     ]
     if _impersonation_active(uid):
         rows.append(
@@ -190,6 +195,312 @@ def _main_menu_kb(role: str, uid: int) -> types.InlineKeyboardMarkup:
             ]
         )
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ------- Settings: Teacher TZ -------
+
+
+def _teacher_tz(actor: Identity) -> str:
+    from app.services.common.time_service import get_course_tz
+
+    try:
+        with db() as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "tz" not in cols:
+                return get_course_tz()
+            row = conn.execute(
+                "SELECT tz FROM users WHERE id=?", (actor.id,)
+            ).fetchone()
+            if row and row[0]:
+                return str(row[0])
+    except Exception:
+        pass
+    return get_course_tz()
+
+
+def _teacher_settings_kb(actor: Identity) -> types.InlineKeyboardMarkup:
+    tz = _teacher_tz(actor)
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text=f"Часовой пояс: {tz}", callback_data=cb("tz", role=actor.role)
+            )
+        ],
+        _nav_keyboard().inline_keyboard[0],
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is("t", {"settings"}))
+async def tui_settings(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    text = "Настройки преподавателя"
+    kb = _teacher_settings_kb(actor)
+    try:
+        await cq.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb)
+    await cq.answer()
+
+
+# Simple TZ picker for teacher (reuse curated list and grouping like owner)
+def _tz_catalog() -> list[str]:
+    try:
+        from app.bot.ui_owner_stub import (
+            _tz_catalog as owner_tz_catalog,  # type: ignore
+        )
+
+        return owner_tz_catalog()
+    except Exception:
+        # Minimal fallback
+        return [
+            "UTC",
+            "Europe/Moscow",
+            "Europe/Kiev",
+            "Europe/Berlin",
+            "Europe/London",
+            "America/New_York",
+            "America/Los_Angeles",
+            "Asia/Tokyo",
+            "Asia/Shanghai",
+            "Asia/Kolkata",
+        ]
+
+
+def _tz_grouping() -> tuple[list[str], dict[str, list[int]]]:
+    zones = _tz_catalog()
+    regions: dict[str, list[int]] = {}
+    for idx, name in enumerate(zones):
+        region = name.split("/", 1)[0] if "/" in name else name
+        regions.setdefault(region, []).append(idx)
+    region_names = sorted(regions.keys())
+    return region_names, regions
+
+
+def _tz_offset_str(tzname: str) -> str:
+    from datetime import datetime, timezone
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(timezone.utc)
+        off = now.astimezone(ZoneInfo(tzname)).utcoffset()
+        if off is None:
+            return "+00:00"
+        total = int(off.total_seconds())
+        sign = "+" if total >= 0 else "-"
+        total = abs(total)
+        hh = total // 3600
+        mm = (total % 3600) // 60
+        return f"{sign}{hh:02d}:{mm:02d}"
+    except Exception:
+        return "+00:00"
+
+
+def _tz_regions_kb(
+    page: int = 0, per_page: int = 12, *, role: str | None = None
+) -> types.InlineKeyboardMarkup:
+    regions, _ = _tz_grouping()
+    total_pages = max(1, (len(regions) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = regions[start : start + per_page]
+    rows: list[list[types.InlineKeyboardButton]] = []
+    for idx, r in enumerate(chunk, start=start):
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=r, callback_data=cb("tz_reg_set", {"r": idx}, role=role)
+                )
+            ]
+        )
+    nav: list[types.InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="« Назад",
+                callback_data=cb("tz_reg_page", {"p": page - 1}, role=role),
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="Вперёд »",
+                callback_data=cb("tz_reg_page", {"p": page + 1}, role=role),
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _tz_cities_kb(
+    region_idx: int, page: int = 0, per_page: int = 12, *, role: str | None = None
+) -> types.InlineKeyboardMarkup:
+    regions, mapping = _tz_grouping()
+    zones = _tz_catalog()
+    if region_idx < 0 or region_idx >= len(regions):
+        return _tz_regions_kb(0, role=role)
+    region = regions[region_idx]
+    global_indices = mapping.get(region, [])
+    items: list[tuple[int, str]] = []
+    for gi in global_indices:
+        name = zones[gi]
+        city = name.split("/", 1)[1] if "/" in name else name
+        off = _tz_offset_str(name)
+        items.append((gi, f"{city} (UTC{off})"))
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = items[start : start + per_page]
+    rows: list[list[types.InlineKeyboardButton]] = []
+    for gi, label in chunk:
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=label, callback_data=cb("tz_set", {"i": gi}, role=role)
+                )
+            ]
+        )
+    nav: list[types.InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="« Назад",
+                callback_data=cb(
+                    "tz_city_page", {"r": region_idx, "p": page - 1}, role=role
+                ),
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="Вперёд »",
+                callback_data=cb(
+                    "tz_city_page", {"r": region_idx, "p": page + 1}, role=role
+                ),
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(
+        [types.InlineKeyboardButton(text="⬅️ Регион", callback_data=cb("tz", role=role))]
+    )
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is("t", {"tz"}))
+async def tui_tz(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    text = "Выберите регион"
+    try:
+        await cq.message.edit_text(
+            text, reply_markup=_tz_regions_kb(0, role=actor.role)
+        )
+    except Exception:
+        await cq.message.answer(text, reply_markup=_tz_regions_kb(0, role=actor.role))
+    await cq.answer()
+
+
+@router.callback_query(_is("t", {"tz_reg_page"}))
+async def tui_tz_reg_page(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    p = int(payload.get("p", 0))
+    try:
+        await cq.message.edit_reply_markup(
+            reply_markup=_tz_regions_kb(p, role=actor.role)
+        )
+    except Exception:
+        await cq.message.answer(
+            "Выбор региона", reply_markup=_tz_regions_kb(p, role=actor.role)
+        )
+    await cq.answer()
+
+
+@router.callback_query(_is("t", {"tz_reg_set"}))
+async def tui_tz_reg_set(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    r = int(payload.get("r", 0))
+    try:
+        await cq.message.edit_text(
+            "Выберите город/зону", reply_markup=_tz_cities_kb(r, 0, role=actor.role)
+        )
+    except Exception:
+        await cq.message.answer(
+            "Выберите город/зону", reply_markup=_tz_cities_kb(r, 0, role=actor.role)
+        )
+    await cq.answer()
+
+
+@router.callback_query(_is("t", {"tz_city_page"}))
+async def tui_tz_city_page(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    r = int(payload.get("r", 0))
+    p = int(payload.get("p", 0))
+    try:
+        await cq.message.edit_reply_markup(
+            reply_markup=_tz_cities_kb(r, p, role=actor.role)
+        )
+    except Exception:
+        await cq.message.answer(
+            "Выбор зоны", reply_markup=_tz_cities_kb(r, p, role=actor.role)
+        )
+    await cq.answer()
+
+
+@router.callback_query(_is("t", {"tz_set"}))
+async def tui_tz_set(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    i = int(payload.get("i", -1))
+    zones = _tz_catalog()
+    if i < 0 or i >= len(zones):
+        return await cq.answer("Некорректный выбор", show_alert=True)
+    tzname = zones[i]
+    # Persist only if schema supports it
+    saved = False
+    try:
+        with db() as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+            if "tz" in cols:
+                conn.execute(
+                    "UPDATE users SET tz=?, updated_at_utc=strftime('%s','now') WHERE id=?",
+                    (tzname, actor.id),
+                )
+                conn.commit()
+                saved = True
+    except Exception:
+        saved = False
+    msg = (
+        f"✅ Часовой пояс сохранён: {tzname}"
+        if saved
+        else "⚠️ Невозможно сохранить TZ: нет поддержки в БД"
+    )
+    kb = _teacher_settings_kb(actor)
+    try:
+        await cq.message.edit_text(msg, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(msg, reply_markup=kb)
+    await cq.answer()
 
 
 # ------- Helpers: manual schedule context -------
@@ -216,10 +527,12 @@ def _manual_ctx_put(uid: int, patch: dict) -> None:
 
 
 def _date_from_choice(choice: str) -> tuple[int, int, int]:
-    """Return (Y, M, D) in local time for a choice like 'today','m1','p2'."""
+    """Return (Y, M, D) in course TZ for a choice like 'today','m1','p2'."""
     import datetime as _dt
 
-    today = _dt.date.today()
+    from app.services.common.time_service import course_today
+
+    today = course_today().date()
     delta = 0
     if choice == "m2":
         delta = -2
@@ -238,10 +551,10 @@ def _date_from_choice(choice: str) -> tuple[int, int, int]:
 
 
 def _utc_ts(year: int, month: int, day: int, hour: int, minute: int) -> int:
-    import datetime as _dt
+    # Interpret local inputs in course TZ and convert to UTC
+    from app.services.common.time_service import local_to_utc_ts
 
-    dt = _dt.datetime(year, month, day, hour, minute, tzinfo=_dt.timezone.utc)
-    return int(dt.timestamp())
+    return local_to_utc_ts(year, month, day, hour, minute)
 
 
 def _loc_key(uid: int) -> str:
@@ -502,11 +815,13 @@ def _ru_wd(d: int) -> str:
 def _date_page_kb(role: str, page: int = 0) -> types.InlineKeyboardMarkup:
     import datetime as _dt
 
-    today = _dt.date.today()
+    from app.services.common.time_service import course_today, to_course_dt
+
+    today = course_today().date()
     last_deadline = _last_deadline_ts()
     max_days = 30
     if last_deadline:
-        dd = _dt.datetime.utcfromtimestamp(last_deadline).date()
+        dd = to_course_dt(last_deadline).date()
         max_days = max(1, min(max_days, (dd - today).days + 1))
     days = [today + _dt.timedelta(days=i) for i in range(max_days)]
 
@@ -1147,8 +1462,20 @@ async def tui_sch_manual_preview(cq: types.CallbackQuery, actor: Identity):
     loc_disp = location if (mode == "online" or location) else "Аудитория по расписанию"
     text_parts = []
     text_parts.append("<b>Шаг 7/7 — предпросмотр</b>")
+    # Build dual time display (course vs teacher)
+    from app.services.common.time_service import get_course_tz, to_course_dt
+
+    course_tz = get_course_tz()
+    teacher_tz = _teacher_tz(actor)
+    # Course-local times (based on inputs)
     text_parts.append(f"<b>Дата:</b> {d:02d}.{m:02d}.{y}")
-    text_parts.append(f"<b>Время:</b> {sh:02d}:{sm:02d}–{eh:02d}:{em:02d}")
+    text_parts.append(f"<b>Время (курс):</b> {sh:02d}:{sm:02d}–{eh:02d}:{em:02d}")
+    if teacher_tz and teacher_tz != course_tz:
+        s_loc = to_course_dt(start_utc, teacher_tz)
+        e_loc = to_course_dt(end_utc, teacher_tz)
+        text_parts.append(
+            f"<b>У вас:</b> {s_loc.hour:02d}:{s_loc.minute:02d}–{e_loc.hour:02d}:{e_loc.minute:02d}"
+        )
     text_parts.append(f"<b>Длительность:</b> {dur} мин")
     text_parts.append(f"<b>Вместимость:</b> {cap}")
     text_parts.append(f"<b>Формат:</b> {'Онлайн' if mode == 'online' else 'Очно'}")
@@ -1993,13 +2320,19 @@ async def tui_sch_manual_list(cq: types.CallbackQuery, actor: Identity):
     if not ts_list:
         text = "Список слотов пуст (проверьте параметры)"
     else:
-        import datetime as _dt
+        from app.services.common.time_service import get_course_tz, to_course_dt
 
-        times = []
+        course_tz = get_course_tz()
+        teacher_tz = _teacher_tz(actor)
+        lines = []
         for s in ts_list:
-            dt = _dt.datetime.fromtimestamp(s, _dt.timezone.utc)
-            times.append(f"{dt.hour:02d}:{dt.minute:02d}")
-        text = "👁 Список слотов:\n" + "\n".join(f"• {t}" for t in times)
+            dt_course = to_course_dt(s, course_tz)
+            label = f"{dt_course.hour:02d}:{dt_course.minute:02d}"
+            if teacher_tz and teacher_tz != course_tz:
+                dt_my = to_course_dt(s, teacher_tz)
+                label += f" (у вас: {dt_my.hour:02d}:{dt_my.minute:02d})"
+            lines.append(f"• {label}")
+        text = "👁 Список слотов (время курса):\n" + "\n".join(lines)
     kb = types.InlineKeyboardMarkup(
         inline_keyboard=[_nav_keyboard().inline_keyboard[0]]
     )
