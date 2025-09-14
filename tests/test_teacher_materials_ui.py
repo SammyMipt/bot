@@ -6,12 +6,19 @@ import time
 def _apply_materials_migrations_all():
     import app.db.conn as conn
 
-    for m in [
-        "migrations/004_course_weeks_schema.sql",
+    with conn.db() as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(weeks)").fetchall()}
+        need_004 = "topic" not in cols
+
+    migrations = []
+    if need_004:
+        migrations.append("migrations/004_course_weeks_schema.sql")
+    migrations += [
         "migrations/005_rewire_materials_weeks.sql",
         "migrations/007_materials_versions.sql",
         "migrations/008_materials_hash_scope.sql",
-    ]:
+    ]
+    for m in migrations:
         with open(m, "r", encoding="utf-8") as f:
             sql = f.read()
         with conn.db() as c:

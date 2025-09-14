@@ -3524,8 +3524,71 @@ async def ownui_impersonation_menus(cq: types.CallbackQuery, actor: Identity):
                 reply_markup=kb,
             )
         return await cq.answer()
-    # Student menu not implemented yet
-    await cq.answer("⛔ Функция не реализована", show_alert=True)
+    # Student main menu (impersonation)
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="📘 Работа с неделями",
+                    callback_data=callbacks.build(
+                        "s", {"action": "weeks"}, role="student"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📅 Мои записи",
+                    callback_data=callbacks.build(
+                        "s", {"action": "my_bookings"}, role="student"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📊 Мои оценки",
+                    callback_data=callbacks.build(
+                        "s", {"action": "my_grades"}, role="student"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📜 История",
+                    callback_data=callbacks.build(
+                        "s", {"action": "history"}, role="student"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="👑 Меню владельца",
+                    callback_data=callbacks.build(
+                        "own", {"action": "start_owner"}, role="owner"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="↩️ Завершить имперсонизацию",
+                    callback_data=callbacks.build(
+                        "own", {"action": "imp_stop"}, role="owner"
+                    ),
+                )
+            ],
+        ]
+    )
+    banner = await _maybe_banner(_uid(cq))
+    try:
+        await cq.message.edit_text(
+            banner + "🎓 Главное меню студента (имперсонизация)",
+            reply_markup=kb,
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + "🎓 Главное меню студента (имперсонизация)",
+            reply_markup=kb,
+        )
+    return await cq.answer()
 
 
 @router.callback_query(_is("own", {"imp_confirm"}))
