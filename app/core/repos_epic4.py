@@ -592,6 +592,21 @@ def list_weeks(limit: int = 50) -> List[int]:
     return [int(r[0]) for r in rows]
 
 
+def list_weeks_with_titles(limit: int = 50) -> List[Tuple[int, str]]:
+    """Возвращает список пар (week_no, title|topic)"""
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT week_no, COALESCE(topic, title, '')
+            FROM weeks
+            ORDER BY week_no ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [(int(r[0]), str(r[1] or "")) for r in rows]
+
+
 # ---------- TEACHER VIEW (read-only) ----------
 
 

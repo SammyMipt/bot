@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from app.db.conn import db
+from app.services.common.time_service import get_course_tz, parse_deadline
 
 EXPECTED_HEADERS = ["week_id", "topic", "description", "deadline"]
 
@@ -29,30 +30,12 @@ def _parse_deadline(value: str) -> Optional[int]:
     v = (value or "").strip()
     if not v:
         return None
-    import re
-    from datetime import datetime, timezone
-
-    # Date-only → default to 23:59 (UTC)
-    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
-        d = datetime.strptime(v, "%Y-%m-%d")
-        dt = d.replace(hour=23, minute=59, second=0, microsecond=0, tzinfo=timezone.utc)
-        return int(dt.timestamp())
-
-    for fmt in (None, "%Y-%m-%d %H:%M"):
-        try:
-            if fmt is None:
-                dt = datetime.fromisoformat(v)
-                # Приводим к UTC: если наивный — считаем UTC; если с TZ — переводим в UTC
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                else:
-                    dt = dt.astimezone(timezone.utc)
-            else:
-                dt = datetime.strptime(v, fmt).replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
-        except Exception:
-            continue
-    raise ValueError("invalid deadline format")
+    # Parse relative to course TZ and convert to UTC epoch
+    try:
+        tz = get_course_tz()
+    except Exception:
+        tz = "UTC"
+    return parse_deadline(v, tz)
 
 
 def parse_weeks_csv(content: bytes) -> ParseResult:
