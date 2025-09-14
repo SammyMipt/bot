@@ -532,6 +532,40 @@ async def owner_menu_cmd(m: types.Message, actor: Identity):
     await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
 
 
+# Explicit stop of impersonation via command
+@router.message(Command("stop"))
+async def owner_stop_impersonation_cmd(
+    m: types.Message, actor: Identity, principal: Identity | None = None
+):
+    # Allow when actor is owner OR real principal is owner (impersonation)
+    is_owner = actor.role == "owner" or (principal and principal.role == "owner")
+    if not is_owner:
+        return await m.answer("⛔ Доступ запрещён.")
+    uid = _uid(m)
+    # Clear impersonation token (idempotent)
+    try:
+        state_store.delete(_imp_key(uid))
+    except Exception:
+        pass
+    try:
+        audit.log("OWNER_IMPERSONATE_STOP", actor.id, meta={"via": "command"})
+    except Exception:
+        pass
+    # Reset UI stack and show owner main menu
+    _stack_reset(uid)
+    banner = await _maybe_banner(uid)
+    await m.answer(banner + "Имперсонизация завершена.")
+    await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
+
+
+# Handle literal text '/stopб' in case of layout typos
+@router.message(F.text == "/stopб")
+async def owner_stop_impersonation_cmd_ru(
+    m: types.Message, actor: Identity, principal: Identity | None = None
+):
+    return await owner_stop_impersonation_cmd(m, actor, principal)
+
+
 @router.message(Command("owner_menu"))
 async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
     if actor.role != "owner":

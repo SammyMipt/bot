@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import html
+
 from aiogram import Router, types
 from aiogram.filters import Command
 
 from app.core import callbacks, state_store
 from app.core.auth import Identity
 from app.core.repos_epic4 import list_weeks_with_titles
+from app.db.conn import db
+from app.services.common.time_service import format_datetime, get_course_tz, utc_now_ts
 
 router = Router(name="ui.student.stub")
 
@@ -244,7 +248,8 @@ async def sui_home(cq: types.CallbackQuery, actor: Identity):
     try:
         callbacks.extract(cq.data, expected_role="student")
     except Exception:
-        await _toast_error(cq, "E_STATE_EXPIRED")
+        # Silent on expired state for idempotent top-level navigation
+        pass
     _stack_reset(_uid(cq))
     text = "Главное меню студента"
     kb = _main_menu_kb()
@@ -290,7 +295,8 @@ async def sui_weeks(cq: types.CallbackQuery, actor: Identity):
     try:
         callbacks.extract(cq.data, expected_role="student")
     except Exception:
-        await _toast_error(cq, "E_STATE_EXPIRED")
+        # Silent on expired state for idempotent top-level navigation
+        pass
     text = "📘 Работа с неделями\nВыберите неделю:"
     kb = _weeks_kb(0)
     try:
@@ -336,6 +342,110 @@ async def sui_week_menu(
     _stack_push(_uid(cq), "week_menu", {"week": int(week_no)})
 
 
+# ------- Week info -------
+
+
+@router.callback_query(_is({"week_info"}))
+async def sui_week_info(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        payload = {}
+    week_no = int(payload.get("week", 0)) if payload else 0
+    if not week_no:
+        return await _toast_error(cq, "E_INPUT_INVALID")
+
+    # Load week info
+    with db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(topic, title, ''), COALESCE(description, ''), deadline_ts_utc FROM weeks WHERE week_no=?",
+            (week_no,),
+        ).fetchone()
+        # Assigned teacher for this student and week (if any)
+        trow = conn.execute(
+            """
+            SELECT COALESCE(u.name, ''), u.tg_id
+            FROM teacher_student_assignments tsa
+            JOIN users u ON u.id = tsa.teacher_id
+            WHERE tsa.week_no = ? AND tsa.student_id = ?
+            LIMIT 1
+            """,
+            (week_no, actor.id),
+        ).fetchone()
+    topic = str(row[0] or "") if row else ""
+    description = str(row[1] or "") if row else ""
+    deadline_ts = int(row[2]) if row and row[2] is not None else None
+
+    # Build HTML card
+    safe_topic = html.escape(topic)
+    safe_desc = html.escape(description)
+    header = (
+        f"📘 <b>W{int(week_no):02d}</b> — {safe_topic}"
+        if safe_topic
+        else f"📘 <b>W{int(week_no):02d}</b>"
+    )
+
+    if deadline_ts:
+        course_tz = get_course_tz()
+        try:
+            dt_str = format_datetime(deadline_ts, course_tz)
+        except Exception:
+            from app.services.common.time_service import format_date
+
+            dt_str = format_date(deadline_ts, course_tz)
+        indicator = "🟢" if deadline_ts >= utc_now_ts() else "🔴"
+        deadline_line = f"⏰ <b>Дедлайн:</b> {dt_str} ({course_tz}) {indicator}"
+    else:
+        deadline_line = "⏰ <b>Дедлайн:</b> без дедлайна"
+
+    parts: list[str] = [header]
+    if safe_desc:
+        parts.append("")
+        parts.append("📝 <b>Описание</b>")
+        parts.append(safe_desc)
+    parts.append("")
+    parts.append(deadline_line)
+    # Assigned teacher line
+    teacher_line: str
+    if trow:
+        tname = html.escape(str(trow[0] or ""))
+        if not tname:
+            tname = f"@{html.escape(str(trow[1] or ''))}" if trow[1] else "(без имени)"
+        teacher_line = f"🧑‍🏫 <b>Принимающий преподаватель:</b> {tname}"
+    else:
+        teacher_line = "🧑‍🏫 <b>Принимающий преподаватель:</b> не назначен"
+    parts.append(teacher_line)
+    parts.append("")
+    parts.append("👉 Выберите действие ниже:")
+
+    text = "\n".join(parts)
+    # Build keyboard: optional contact + nav
+    rows: list[list[types.InlineKeyboardButton]] = []
+    # Add contact button if we have a username-like tg_id (@username)
+    try:
+        if trow and trow[1] and str(trow[1]).startswith("@"):
+            username = str(trow[1]).lstrip("@")
+            rows.append(
+                [
+                    types.InlineKeyboardButton(
+                        text="📬 Написать преподавателю", url=f"https://t.me/{username}"
+                    )
+                ]
+            )
+    except Exception:
+        pass
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+
+
 # ------- Stubs for week actions -------
 
 
@@ -346,7 +456,6 @@ def _dev_stub_text() -> str:
 @router.callback_query(
     _is(
         {
-            "week_info",
             "week_prep",
             "week_notes",
             "week_slides",
