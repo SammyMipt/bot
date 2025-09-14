@@ -7,11 +7,16 @@ from aiogram.filters import Command
 
 from app.core import callbacks, state_store
 from app.core.auth import Identity
-from app.core.repos_epic4 import list_weeks_with_titles
+from app.core.repos_epic4 import list_materials_by_week, list_weeks_with_titles
 from app.db.conn import db
 from app.services.common.time_service import format_datetime, get_course_tz, utc_now_ts
 
 router = Router(name="ui.student.stub")
+
+try:
+    from aiogram.types import BufferedInputFile
+except Exception:  # pragma: no cover
+    BufferedInputFile = None  # type: ignore
 
 
 def _uid(x: types.Message | types.CallbackQuery) -> int:
@@ -129,8 +134,8 @@ def _main_menu_kb() -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _weeks_kb(page: int = 0, per_page: int = 10) -> types.InlineKeyboardMarkup:
-    items = list_weeks_with_titles(limit=100)
+def _weeks_kb(page: int = 0, per_page: int = 8) -> types.InlineKeyboardMarkup:
+    items = list_weeks_with_titles(limit=200)
     weeks = sorted(items, key=lambda x: x[0])
     total_pages = max(1, (len(weeks) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
@@ -138,7 +143,9 @@ def _weeks_kb(page: int = 0, per_page: int = 10) -> types.InlineKeyboardMarkup:
     chunk = weeks[start : start + per_page]
     rows: list[list[types.InlineKeyboardButton]] = []
     for wno, title in chunk:
-        label = f"W{wno:02d} — {title}"
+        label = f"📘 Неделя {int(wno)}"
+        if title:
+            label += f". {title}"
         rows.append(
             [
                 types.InlineKeyboardButton(
@@ -175,13 +182,13 @@ def _week_menu_kb(week: int) -> types.InlineKeyboardMarkup:
         ],
         [
             types.InlineKeyboardButton(
-                text="📖 Домашние задачи и материалы",
-                callback_data=cb("week_prep", {"week": week}),
+                text="📄 Материалы недели",
+                callback_data=cb("materials_week", {"week": week}),
             )
         ],
         [
             types.InlineKeyboardButton(
-                text="📝 Конспекты", callback_data=cb("week_notes", {"week": week})
+                text="📚 Конспект", callback_data=cb("week_notes", {"week": week})
             ),
             types.InlineKeyboardButton(
                 text="📊 Презентации", callback_data=cb("week_slides", {"week": week})
@@ -189,7 +196,7 @@ def _week_menu_kb(week: int) -> types.InlineKeyboardMarkup:
         ],
         [
             types.InlineKeyboardButton(
-                text="🎥 Записи лекций", callback_data=cb("week_video", {"week": week})
+                text="🎥 Запись лекции", callback_data=cb("week_video", {"week": week})
             )
         ],
         [
@@ -446,27 +453,203 @@ async def sui_week_info(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-# ------- Stubs for week actions -------
+# ------- Materials for week (student) -------
+
+
+def _week_id_by_no(week_no: int) -> int | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM weeks WHERE week_no=?", (week_no,)
+        ).fetchone()
+        return int(row[0]) if row else None
+
+
+async def _send_material(cq: types.CallbackQuery, *, week_no: int, mtype: str) -> None:
+    # Enforce visibility: students see only public materials
+    mats = list_materials_by_week(int(week_no), audience="student")
+    mat = next(
+        (m for m in mats if str(m.type) == mtype and int(m.is_active or 0) == 1), None
+    )
+    if not mat:
+        return await _toast_error(cq, "E_NOT_FOUND", "Материал не найден")
+    # Build labels like teacher UI
+    title_map = dict(list_weeks_with_titles(limit=200))
+    title = title_map.get(int(week_no), "")
+    labels = {
+        "p": ("📄", "Материалы недели"),
+        "n": ("📚", "Конспект"),
+        "s": ("📊", "Презентация"),
+        "v": ("🎥", "Запись лекции"),
+    }
+    emoji, name = labels.get(mtype, ("📄", "Материал"))
+
+    # Video/link material
+    if mtype == "v":
+        url = str(mat.path)
+        try:
+            msg = f"{emoji} <b>Неделя {int(week_no)}"
+            if title:
+                msg += f". {title}"
+            msg += f'.</b> <a href="{url}">{name}</a>'
+            await cq.message.answer(
+                msg, parse_mode="HTML", disable_web_page_preview=True
+            )
+        except Exception:
+            pass
+        return await cq.answer("Ссылка отправлена")
+
+    # File material
+    try:
+        import os
+
+        fname = os.path.basename(str(mat.path)) or "material.bin"
+        with open(str(mat.path), "rb") as f:
+            data = f.read()
+        if BufferedInputFile is not None:
+            caption = f"{emoji} <b>Неделя {int(week_no)}"
+            if title:
+                caption += f". {title}"
+            caption += f".</b> {name}."
+            await cq.message.answer_document(
+                BufferedInputFile(data, filename=fname),
+                caption=caption,
+                parse_mode="HTML",
+            )
+        else:  # Fallback: send as text path
+            await cq.message.answer(f"Файл: {fname}\nПуть: {mat.path}")
+        await cq.answer("Файл отправлен")
+    except FileNotFoundError:
+        await _toast_error(cq, "E_NOT_FOUND", "Файл недоступен")
+    except Exception:
+        await _toast_error(cq, "E_STATE_INVALID", "Не удалось отправить файл")
+
+
+def _materials_types_kb_s(week: int) -> types.InlineKeyboardMarkup:
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text="📄 Материалы недели",
+                callback_data=cb("week_prep", {"week": week}),
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="📚 Конспект", callback_data=cb("week_notes", {"week": week})
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="📊 Презентация", callback_data=cb("week_slides", {"week": week})
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="🎥 Запись лекции", callback_data=cb("week_video", {"week": week})
+            )
+        ],
+        _nav_keyboard().inline_keyboard[0],
+    ]
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is({"materials_week"}))
+async def sui_materials_week(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    week_no = 0
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+        week_no = int(payload.get("week", 0))
+    except Exception:
+        # Try last week from stack
+        last = _stack_pop(_uid(cq)) or {}
+        p = dict(last.get("p") or {})
+        week_no = int(p.get("week", 0))
+    title = dict(list_weeks_with_titles(limit=200)).get(int(week_no), "")
+    if title:
+        text = f"📚 <b>Неделя {int(week_no)}. {title}</b>\nВыберите материал:"
+    else:
+        text = f"📚 <b>Неделя {int(week_no)}</b>\nВыберите материал:"
+    kb = _materials_types_kb_s(int(week_no))
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+    _stack_push(_uid(cq), "materials_week", {"week": int(week_no)})
+
+
+@router.callback_query(_is({"week_prep"}))
+async def sui_week_send_prep(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    await _send_material(cq, week_no=int(payload.get("week", 0)), mtype="p")
+
+
+@router.callback_query(_is({"week_notes"}))
+async def sui_week_send_notes(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    await _send_material(cq, week_no=int(payload.get("week", 0)), mtype="n")
+
+
+@router.callback_query(_is({"week_slides"}))
+async def sui_week_send_slides(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    await _send_material(cq, week_no=int(payload.get("week", 0)), mtype="s")
+
+
+@router.callback_query(_is({"week_video"}))
+async def sui_week_send_video(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    await _send_material(cq, week_no=int(payload.get("week", 0)), mtype="v")
+
+
+# ------- Stubs for remaining actions -------
 
 
 def _dev_stub_text() -> str:
     return "Функция в разработке"
 
 
-@router.callback_query(
-    _is(
-        {
-            "week_prep",
-            "week_notes",
-            "week_slides",
-            "week_video",
-            "week_upload",
-            "week_book",
-            "week_unbook",
-            "week_grade",
-        }
-    )
-)
+@router.callback_query(_is({"week_upload", "week_book", "week_unbook", "week_grade"}))
+async def sui_other_week_action_stub(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+    try:
+        await cq.message.edit_text(_dev_stub_text(), reply_markup=_nav_keyboard())
+    except Exception:
+        await cq.message.answer(_dev_stub_text(), reply_markup=_nav_keyboard())
+    await cq.answer("Страница-заглушка")
+
+
+# Backward-compat: keep original stub function name for tests
 async def sui_week_action_stub(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "student":
         return await cq.answer("⛔ Доступ запрещён", show_alert=True)

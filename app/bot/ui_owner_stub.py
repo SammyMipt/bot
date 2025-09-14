@@ -558,14 +558,6 @@ async def owner_stop_impersonation_cmd(
     await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
 
 
-# Handle literal text '/stopб' in case of layout typos
-@router.message(F.text == "/stopб")
-async def owner_stop_impersonation_cmd_ru(
-    m: types.Message, actor: Identity, principal: Identity | None = None
-):
-    return await owner_stop_impersonation_cmd(m, actor, principal)
-
-
 @router.message(Command("owner_menu"))
 async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
     if actor.role != "owner":
