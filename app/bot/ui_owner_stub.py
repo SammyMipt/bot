@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from aiogram import F, Router, types
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 
 from app.core import audit, callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
@@ -568,36 +568,8 @@ async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
     await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
 
 
-@router.message(CommandStart())
-async def owner_menu_on_start(m: types.Message, actor: Identity):
-    # Only handle owners here; others are handled by registration router
-    if actor.role != "owner":
-        return
-    uid = _uid(m)
-    # If owner also configured as teacher → offer a role chooser per docs
-    if _owner_has_teacher_cap(actor.id):
-        kb = types.InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    types.InlineKeyboardButton(
-                        text="👑 Главное меню владельца",
-                        callback_data=cb("start_owner"),
-                    )
-                ],
-                [
-                    types.InlineKeyboardButton(
-                        text="📚 Главное меню преподавателя",
-                        callback_data=cb("start_teacher"),
-                    )
-                ],
-            ]
-        )
-        await m.answer("Выберите раздел:", reply_markup=kb)
-        return
-    # Default: open owner main menu
-    _stack_reset(uid)
-    banner = await _maybe_banner(uid)
-    await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
+# Note: /start is handled by the registration router only.
+# Owner can open main menu via /owner or /owner_menu.
 
 
 def _owner_has_teacher_cap(user_id: str) -> bool:
@@ -1009,13 +981,15 @@ async def ownui_course_tz_set(cq: types.CallbackQuery, actor: Identity):
 
     with db() as conn:
         now = utc_now_ts()
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO course(id, name, created_at_utc, updated_at_utc, tz) VALUES(1, 'Course', ?, ?, ?)",
-                (now, now, tzname),
+        row = conn.execute("SELECT id FROM course WHERE id=1").fetchone()
+        if not row:
+            # Require explicit course creation via name before TZ can be set
+            await cq.message.answer(
+                "⛔ Сначала введите название курса",
+                reply_markup=_nav_keyboard("course"),
             )
-        except Exception:
-            pass
+            await cq.answer()
+            return
         conn.execute(
             "UPDATE course SET tz=?, updated_at_utc=? WHERE id=1", (tzname, now)
         )
@@ -1314,13 +1288,14 @@ async def ownui_course_init_tz_set(cq: types.CallbackQuery, actor: Identity):
 
     with db() as conn:
         now = utc_now_ts()
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO course(id, name, created_at_utc, updated_at_utc, tz) VALUES(1, 'Course', ?, ?, ?)",
-                (now, now, tzname),
+        row = conn.execute("SELECT id FROM course WHERE id=1").fetchone()
+        if not row:
+            await cq.message.answer(
+                "⛔ Сначала введите название курса",
+                reply_markup=_nav_keyboard("course"),
             )
-        except Exception:
-            pass
+            await cq.answer()
+            return
         conn.execute(
             "UPDATE course SET tz=?, updated_at_utc=? WHERE id=1", (tzname, now)
         )

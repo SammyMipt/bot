@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import html
 
-from aiogram import Router, types
+from aiogram import F, Router, types
 from aiogram.filters import Command
 
-from app.core import callbacks, state_store
+from app.core import audit, callbacks, state_store
 from app.core.auth import Identity
-from app.core.repos_epic4 import list_materials_by_week, list_weeks_with_titles
+from app.core.files import ensure_parent_dir, link_or_copy, safe_filename, save_blob
+from app.core.repos_epic4 import (
+    add_student_submission_file,
+    list_materials_by_week,
+    list_submission_files,
+    list_weeks_with_titles,
+    soft_delete_student_submission_file,
+)
 from app.db.conn import db
 from app.services.common.time_service import format_datetime, get_course_tz, utc_now_ts
 
@@ -347,6 +354,389 @@ async def sui_week_menu(
         await cq.message.answer(text, reply_markup=kb)
     await cq.answer()
     _stack_push(_uid(cq), "week_menu", {"week": int(week_no)})
+
+
+# ------- Upload solutions (student) -------
+
+
+def _upload_key(uid: int) -> str:
+    return f"s_upload:{uid}"
+
+
+def _fmt_bytes(num: int) -> str:
+    try:
+        for unit in ("Б", "КБ", "МБ", "ГБ"):
+            if num < 1024:
+                return f"{num} {unit}"
+            num //= 1024
+    except Exception:
+        pass
+    return f"{num} Б"
+
+
+def _allowed_submission_exts() -> set[str]:
+    # Только картинки или PDF
+    return {".pdf", ".png", ".jpg", ".jpeg"}
+
+
+def _student_bucket(actor: Identity) -> str:
+    # В доке — humanized ID (ST001). В текущей схеме его нет, используем UUID студента.
+    return str(actor.id or "unknown")
+
+
+def _surname_from_name(full_name: str | None) -> str:
+    try:
+        if not full_name:
+            return "student"
+        parts = [p for p in full_name.strip().split() if p]
+        if not parts:
+            return "student"
+        cand = parts[0]
+        return safe_filename(cand)
+    except Exception:
+        return "student"
+
+
+def _next_file_index(student_id: str, week: int) -> int:
+    try:
+        with db() as conn:
+            row = conn.execute(
+                (
+                    "SELECT COUNT(1) FROM students_submissions "
+                    "WHERE student_id=? AND week_no=? AND deleted_at_utc IS NULL"
+                ),
+                (student_id, week),
+            ).fetchone()
+            return int(row[0] or 0) + 1
+    except Exception:
+        return 1
+
+
+def _materialize_submission_path(actor: Identity, week: int, *, ext: str) -> str:
+    import os
+
+    safe_ext = (ext or "").lower()
+    if not safe_ext.startswith("."):
+        safe_ext = "." + safe_ext if safe_ext else ".bin"
+    surname = _surname_from_name(actor.name)
+    week_tag = f"Н{int(week):02d}"
+    index = _next_file_index(actor.id, week)
+    fname = f"{surname}_{week_tag}_{index}{safe_ext}"
+    rel = os.path.join(
+        "var", "submissions", _student_bucket(actor), f"W{int(week):02d}", fname
+    )
+    ensure_parent_dir(rel)
+    return rel
+
+
+def _week_upload_kb(
+    week: int, last_file_id: int | None = None
+) -> types.InlineKeyboardMarkup:
+    rows: list[list[types.InlineKeyboardButton]] = []
+    rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="➕ Загрузить ещё", callback_data=cb("week_upload", {"week": week})
+            )
+        ]
+    )
+    if last_file_id is not None:
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text="🗑️ Удалить этот файл",
+                    callback_data=cb(
+                        "week_upload_delete", {"week": week, "fid": int(last_file_id)}
+                    ),
+                )
+            ]
+        )
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is({"week_upload"}))
+async def sui_week_upload(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        payload = {}
+    week_no = int((payload or {}).get("week", 0))
+    if not week_no:
+        return await _toast_error(cq, "E_INPUT_INVALID")
+    # Put state to expect a document
+    state_store.put_at(
+        _upload_key(_uid(cq)),
+        "s_upload",
+        {"mode": "await_doc", "w": week_no},
+        ttl_sec=900,
+    )
+    # Show instruction + current counters
+    try:
+        files = list_submission_files(actor.id, week_no)
+    except Exception:
+        files = []
+    total_sz = sum(int(f.get("size_bytes") or 0) for f in files)
+    title_map = dict(list_weeks_with_titles(limit=200))
+    title = title_map.get(int(week_no), "")
+    header = (
+        f"📤 <b>Загрузка решений — W{int(week_no):02d}"
+        + (f". {html.escape(title)}" if title else "")
+        + "</b>"
+    )
+    lines = [
+        header,
+        "Отправьте файл (PNG/JPG/PDF)",
+        "Лимиты: ≤5 файлов, ≤30 МБ суммарно",
+        f"Сейчас: файлов {len(files)}, сумма {_fmt_bytes(total_sz)}",
+    ]
+    kb = _week_upload_kb(week_no)
+    try:
+        await cq.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+    _stack_push(_uid(cq), "week_upload", {"week": int(week_no)})
+
+
+def _awaits_upload_doc(m: types.Message) -> bool:
+    try:
+        act, st = state_store.get(_upload_key(_uid(m)))
+        return act == "s_upload" and (st or {}).get("mode") == "await_doc"
+    except Exception:
+        return False
+
+
+@router.message(F.document, _awaits_upload_doc)
+async def sui_receive_submission_doc(m: types.Message, actor: Identity):
+    if actor.role != "student":
+        return
+    try:
+        _, st = state_store.get(_upload_key(_uid(m)))
+    except Exception:
+        return
+    week = int(st.get("w", 0))
+    if not week:
+        return
+    doc = m.document
+    # Validate limits before download
+    try:
+        current_files = list_submission_files(actor.id, week)
+    except Exception:
+        current_files = []
+    if len(current_files) >= 5:
+        return await m.answer("⚠️ Достигнут лимит: ≤5 файлов")
+    try:
+        fsz = int(getattr(doc, "file_size", 0) or 0)
+    except Exception:
+        fsz = 0
+    total_sz = sum(int(f.get("size_bytes") or 0) for f in current_files)
+    if fsz and total_sz + fsz > 30 * 1024 * 1024:
+        return await m.answer("⚠️ Превышен лимит: ≤30 МБ суммарно")
+    # Validate extension by whitelist
+    fname_l = (getattr(doc, "file_name", None) or "").lower()
+    ext = "." + fname_l.rsplit(".", 1)[-1] if "." in fname_l else ""
+    if ext not in _allowed_submission_exts():
+        return await m.answer("⛔ Неподдерживаемый тип файла")
+    # Download and save
+    try:
+        file = await m.bot.get_file(doc.file_id)
+        b = await m.bot.download_file(file.file_path)
+        data = b.read()
+    except Exception:
+        return await m.answer("⛔ Ошибка хранения файла")
+    saved = save_blob(
+        data, prefix="submissions", suggested_name=getattr(doc, "file_name", None)
+    )
+    # Сначала записываем запись (анти-дубликат), затем материализуем файл по человекочитаемому пути
+    dest_path = _materialize_submission_path(actor, week, ext=ext or ".bin")
+    fid = add_student_submission_file(
+        student_id=actor.id,
+        week_no=week,
+        sha256=saved.sha256,
+        size_bytes=saved.size_bytes,
+        path=dest_path,
+        mime=getattr(doc, "mime_type", None),
+    )
+    if fid == -1:
+        return await m.answer("⚠️ Такой файл уже загружен (дубликат)")
+    try:
+        link_or_copy(saved.path, dest_path)
+    except Exception:
+        pass
+    # Audit
+    try:
+        audit.log(
+            "STUDENT_SUBMISSION_UPLOAD",
+            actor.id,
+            meta={
+                "week": int(week),
+                "file_uuid": saved.sha256,
+                "size_bytes": int(saved.size_bytes),
+                "sha256": saved.sha256,
+                "storage_path": saved.path,
+            },
+        )
+    except Exception:
+        pass
+    title_map = dict(list_weeks_with_titles(limit=200))
+    title = title_map.get(int(week), "")
+    msg = (
+        f"📤 <b>Файл загружен — W{int(week):02d}"
+        + (f". {html.escape(title)}" if title else "")
+        + "</b>"
+    )
+    await m.answer(
+        msg,
+        reply_markup=_week_upload_kb(
+            week, last_file_id=int(fid) if isinstance(fid, int) else None
+        ),
+        parse_mode="HTML",
+    )
+    # keep awaiting for more uploads
+    state_store.put_at(
+        _upload_key(_uid(m)), "s_upload", {"mode": "await_doc", "w": week}, ttl_sec=900
+    )
+
+
+if hasattr(F, "photo"):
+
+    @router.message(F.photo, _awaits_upload_doc)
+    async def sui_receive_submission_photo(m: types.Message, actor: Identity):
+        """Handle images sent as photo (Telegram compresses them). Treat as JPG."""
+        if actor.role != "student":
+            return
+        try:
+            _, st = state_store.get(_upload_key(_uid(m)))
+        except Exception:
+            return
+        week = int(st.get("w", 0))
+        if not week:
+            return
+        try:
+            current_files = list_submission_files(actor.id, week)
+        except Exception:
+            current_files = []
+        if len(current_files) >= 5:
+            return await m.answer("⚠️ Достигнут лимит: ≤5 файлов")
+        try:
+            ph = m.photo[-1] if getattr(m, "photo", None) else None
+            fsz = int(getattr(ph, "file_size", 0) or 0)
+        except Exception:
+            fsz = 0
+        total_sz = sum(int(f.get("size_bytes") or 0) for f in current_files)
+        if fsz and total_sz + fsz > 30 * 1024 * 1024:
+            return await m.answer("⚠️ Превышен лимит: ≤30 МБ суммарно")
+        # Download the largest available photo
+        try:
+            file = await m.bot.get_file(ph.file_id)
+            b = await m.bot.download_file(file.file_path)
+            data = b.read()
+        except Exception:
+            return await m.answer("⛔ Ошибка хранения файла")
+        # Treat as JPEG by default
+        saved = save_blob(data, prefix="submissions", suggested_name="photo.jpg")
+        dest_path = _materialize_submission_path(actor, week, ext=".jpg")
+        fid = add_student_submission_file(
+            student_id=actor.id,
+            week_no=week,
+            sha256=saved.sha256,
+            size_bytes=saved.size_bytes,
+            path=dest_path,
+            mime="image/jpeg",
+        )
+        if fid == -1:
+            return await m.answer("⚠️ Такой файл уже загружен (дубликат)")
+        try:
+            link_or_copy(saved.path, dest_path)
+        except Exception:
+            pass
+        try:
+            audit.log(
+                "STUDENT_SUBMISSION_UPLOAD",
+                actor.id,
+                meta={
+                    "week": int(week),
+                    "file_uuid": saved.sha256,
+                    "size_bytes": int(saved.size_bytes),
+                    "sha256": saved.sha256,
+                    "storage_path": saved.path,
+                },
+            )
+        except Exception:
+            pass
+        title_map = dict(list_weeks_with_titles(limit=200))
+        title = title_map.get(int(week), "")
+        msg = (
+            f"📤 <b>Файл загружен — W{int(week):02d}"
+            + (f". {html.escape(title)}" if title else "")
+            + "</b>"
+        )
+        await m.answer(
+            msg,
+            reply_markup=_week_upload_kb(
+                week, last_file_id=int(fid) if isinstance(fid, int) else None
+            ),
+            parse_mode="HTML",
+        )
+        # keep awaiting for more uploads
+        state_store.put_at(
+            _upload_key(_uid(m)),
+            "s_upload",
+            {"mode": "await_doc", "w": week},
+            ttl_sec=900,
+        )
+
+else:
+
+    async def sui_receive_submission_photo(*_a, **_k):  # type: ignore
+        return None
+
+
+@router.callback_query(_is({"week_upload_delete"}))
+async def sui_delete_submission_file(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        return await _toast_error(cq, "E_STATE_EXPIRED")
+    week = int(payload.get("week", 0))
+    fid = int(payload.get("fid", 0))
+    if not week or not fid:
+        return await _toast_error(cq, "E_STATE_INVALID")
+    ok = soft_delete_student_submission_file(fid, actor.id)
+    if not ok:
+        return await _toast_error(cq, "E_ACCESS_DENIED", "Не удалось удалить файл")
+    # Show updated counters
+    try:
+        files = list_submission_files(actor.id, week)
+    except Exception:
+        files = []
+    total_sz = sum(int(f.get("size_bytes") or 0) for f in files)
+    title_map = dict(list_weeks_with_titles(limit=200))
+    title = title_map.get(int(week), "")
+    header = (
+        f"📤 <b>Загрузка решений — W{int(week):02d}"
+        + (f". {html.escape(title)}" if title else "")
+        + "</b>"
+    )
+    lines = [
+        header,
+        "✅ Файл удалён",
+        "Отправьте файл (PNG/JPG/PDF)",
+        "Лимиты: ≤5 файлов, ≤30 МБ суммарно",
+        f"Сейчас: файлов {len(files)}, сумма {_fmt_bytes(total_sz)}",
+    ]
+    kb = _week_upload_kb(week)
+    try:
+        await cq.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
 
 
 # ------- Week info -------

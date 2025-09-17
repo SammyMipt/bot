@@ -8,8 +8,6 @@ CREATE TABLE IF NOT EXISTS course (
   created_at_utc   INTEGER NOT NULL,
   updated_at_utc   INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO course(id, name, created_at_utc, updated_at_utc)
-VALUES (1, 'Course', strftime('%s','now'), strftime('%s','now'));
 
 -- Extend weeks with topic/description/deadline
 ALTER TABLE weeks ADD COLUMN topic TEXT;

@@ -2,6 +2,10 @@ import asyncio
 import importlib
 import time
 
+import pytest
+
+pytestmark = pytest.mark.usefixtures("db_tmpdir")
+
 
 def _apply_materials_migrations_all():
     import app.db.conn as conn

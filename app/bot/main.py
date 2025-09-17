@@ -44,13 +44,13 @@ async def main():
     from app.bot.commands_epic3 import router as epic3_router
 
     dp.include_router(epic3_router)
-    # 🔽 OWNER/TEACHER/STUDENT UI: place before registration to avoid conflicts with broad text handlers
+    # 🔽 EPIC-5: registration router — place BEFORE UI so /start isn't swallowed by broad text handlers
+    dp.include_router(epic5_register_owner_router)
+    dp.include_router(epic5_register_router)
+    # 🔽 OWNER/TEACHER/STUDENT UI
     dp.include_router(ui_owner_stub_router)
     dp.include_router(ui_teacher_stub_router)
     dp.include_router(ui_student_stub_router)
-    # 🔽 EPIC-5: registration router
-    dp.include_router(epic5_register_owner_router)
-    dp.include_router(epic5_register_router)
     # 🔽 EPIC-4: order matters — owner/teacher first, then student
     dp.include_router(epic4_owner_router)
     dp.include_router(epic4_teacher_router)

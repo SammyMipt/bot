@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from aiogram import F, Router, types
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 
 from app.core import callbacks, state_store
 from app.core.auth import Identity, create_user, get_user_by_tg
@@ -9,6 +9,11 @@ from app.core.config import cfg
 from app.db import repo_users
 
 router = Router(name="epic5.register_owner")
+OWNER_IDS: set[int] = set()
+try:
+    OWNER_IDS = {int(x) for x in cfg.telegram_owner_ids if x.isdigit()}
+except Exception:
+    OWNER_IDS = set()
 
 
 def _op(op: str):
@@ -50,10 +55,25 @@ async def owner_start(m: types.Message, actor: Identity):
     # If already registered — let the general flow handle it
     if get_user_by_tg(tg):
         return
-    # Only for predefined owner ids
+    # Only react for predefined owner ids
     if tg not in cfg.telegram_owner_ids:
-        await m.answer("🧱 Курс не инициализован. Ведутся технические работы")
-        return  # not an owner → stop here
+        return  # let general /start handle non-owners
+    # Owner: show owner registration entry only (без дублирования общего меню)
+    await m.answer(
+        "👋 Добро пожаловать!\nВаш Telegram ID подтверждён как владелец курса.",
+        reply_markup=_start_kb(actor.role),
+    )
+
+
+@router.message(Command("owner_start"))
+async def owner_start_cmd(m: types.Message, actor: Identity):
+    tg = _eff_tg_id(m.from_user.id)
+    if get_user_by_tg(tg):
+        await m.answer("Вы уже зарегистрированы как владелец.")
+        return
+    if tg not in cfg.telegram_owner_ids:
+        await m.answer("⛔ Доступ запрещён")
+        return
     await m.answer(
         "👋 Добро пожаловать!\nВаш Telegram ID подтверждён как владелец курса.",
         reply_markup=_start_kb(actor.role),
@@ -242,13 +262,18 @@ async def owner_name_ask(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-@router.message(F.text)
-async def owner_name_set(m: types.Message, actor: Identity):
+def _awaits_owner_name(m: types.Message) -> bool:
     try:
         _, st = state_store.get(_own_key(m.from_user.id))
+        return bool(st) and st.get("step") == "name"
     except Exception:
-        return
-    if not st or st.get("step") != "name":
+        return False
+
+
+@router.message(F.text, _awaits_owner_name)
+async def owner_name_set(m: types.Message, actor: Identity):
+    # ignore commands
+    if (m.text or "").strip().startswith("/"):
         return
     name = (m.text or "").strip()
     if not name:
