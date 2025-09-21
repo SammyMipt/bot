@@ -7,6 +7,15 @@ from aiogram.filters import Command
 
 from app.core import audit, callbacks, state_store
 from app.core.auth import Identity
+from app.core.bookings_repo import (
+    BookingError,
+    book_slot_for_week,
+    cancel_week_booking,
+    get_assigned_teacher,
+    list_active_bookings,
+    list_available_slots_for_week,
+    list_history,
+)
 from app.core.files import ensure_parent_dir, link_or_copy, safe_filename, save_blob
 from app.core.repos_epic4 import (
     add_student_submission_file,
@@ -38,6 +47,14 @@ ERROR_MESSAGES: dict[str, str] = {
     "E_STATE_INVALID": "⛔ Некорректное состояние запроса",
     "E_STATE_EXPIRED": "⛔ Сессия истекла. Начните заново.",
     "E_NOT_FOUND": "❌ Не найдено",
+    # Booking-specific
+    "E_ALREADY_BOOKED": "⚠️ У вас уже есть запись на эту неделю",
+    "E_SLOT_FULL": "⚠️ Слот полностью занят",
+    "E_SLOT_CLOSED": "⚠️ Слот закрыт для записи",
+    "E_PAST_DEADLINE": "⚠️ Запись недоступна после дедлайна",
+    "E_ALREADY_GRADED": "⚠️ Оценка уже выставлена по этой неделе",
+    "E_NOT_ASSIGNED": "⚠️ Для этой недели не назначен преподаватель",
+    "E_SCHEMA_MISSING": "⚠️ Недоступно: требуется обновление БД",
 }
 
 
@@ -221,7 +238,7 @@ def _week_menu_kb(week: int) -> types.InlineKeyboardMarkup:
         [
             types.InlineKeyboardButton(
                 text="❌ Отменить запись",
-                callback_data=cb("week_unbook", {"week": week}),
+                callback_data=cb("week_unbook", {"week": week, "src": "wk"}),
             )
         ],
         [
@@ -295,6 +312,8 @@ async def sui_back(cq: types.CallbackQuery, actor: Identity):
         week = int(p.get("week", 0)) if p else 0
         if week:
             return await sui_week_menu(cq, actor, week)
+    if s == "my_bookings":
+        return await sui_list_my_bookings(cq, actor)
     # Fallback
     return await sui_home(cq, actor)
 
@@ -1017,6 +1036,362 @@ async def sui_week_send_video(cq: types.CallbackQuery, actor: Identity):
     await _send_material(cq, week_no=int(payload.get("week", 0)), mtype="v")
 
 
+# ------- Booking: list/select/confirm/cancel + lists -------
+
+
+def _fmt_dt(ts: int) -> str:
+    tz = get_course_tz()
+    try:
+        return format_datetime(int(ts), tz)
+    except Exception:
+        from app.services.common.time_service import format_date
+
+        return format_date(int(ts), tz)
+
+
+def _fmt_dt_wd(ts: int) -> str:
+    from app.services.common.time_service import to_course_dt
+
+    tz = get_course_tz()
+    try:
+        dt = to_course_dt(int(ts), tz)
+        wd = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][dt.weekday()]
+        return f"{wd} {dt.strftime('%Y-%m-%d %H:%M')}"
+    except Exception:
+        return _fmt_dt(ts)
+
+
+def _book_slots_kb(
+    week: int, page: int, total_pages: int, items: list[tuple[int, str]]
+) -> types.InlineKeyboardMarkup:
+    rows: list[list[types.InlineKeyboardButton]] = []
+    for sid, label in items:
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb(
+                        "book_slot_pick", {"week": week, "sid": sid, "p": page}
+                    ),
+                )
+            ]
+        )
+    nav: list[types.InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="« Назад",
+                callback_data=cb("book_slots_page", {"week": week, "p": page - 1}),
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="Вперёд »",
+                callback_data=cb("book_slots_page", {"week": week, "p": page + 1}),
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is({"week_book"}))
+async def sui_week_book(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    week = int(payload.get("week", 0))
+    if not week:
+        return await _toast_error(cq, "E_INPUT_INVALID")
+    # Check assigned teacher
+    teacher_id = get_assigned_teacher(actor.id, week)
+    if not teacher_id:
+        return await _toast_error(cq, "E_NOT_ASSIGNED")
+    # List available slots
+    slots = list_available_slots_for_week(actor.id, week)
+    if not slots:
+        try:
+            await cq.message.edit_text(
+                "⚠️ Нет доступных слотов", reply_markup=_nav_keyboard()
+            )
+        except Exception:
+            await cq.message.answer(
+                "⚠️ Нет доступных слотов", reply_markup=_nav_keyboard()
+            )
+        return await cq.answer()
+    # paginate
+    page = 0
+    per = 10
+    total_pages = max(1, (len(slots) + per - 1) // per)
+    chunk = slots[0:per]
+    items = []
+    for s in chunk:
+        label = f"{_fmt_dt_wd(s.starts_at_utc)} · 👥 {s.booked}/{s.capacity}"
+        items.append((s.id, label))
+    kb = _book_slots_kb(week, page, total_pages, items)
+    # Include teacher name in header
+    with db() as conn:
+        trow = conn.execute(
+            (
+                "SELECT COALESCE(u.name, u.tg_id, '') FROM teacher_student_assignments tsa "
+                "JOIN users u ON u.id = tsa.teacher_id WHERE tsa.week_no=? AND tsa.student_id=? LIMIT 1"
+            ),
+            (week, actor.id),
+        ).fetchone()
+    tname = html.escape(str(trow[0] or "")) if trow else ""
+    header = f"⏰ Запись на Неделя {int(week)}"
+    if tname:
+        header += f"\n🧑‍🏫 Принимает: {tname}"
+    header += "\nВыберите слот:"
+    try:
+        await cq.message.edit_text(header, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(header, reply_markup=kb)
+    await cq.answer()
+    _stack_push(_uid(cq), "week_book", {"week": int(week)})
+
+
+@router.callback_query(_is({"book_slots_page"}))
+async def sui_book_slots_page(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role="student")
+    week = int(payload.get("week", 0))
+    page = int(payload.get("p", 0))
+    slots = list_available_slots_for_week(actor.id, week)
+    per = 10
+    total_pages = max(1, (len(slots) + per - 1) // per)
+    page = max(0, min(page, total_pages - 1))
+    chunk = slots[page * per : page * per + per]
+    items = []
+    for s in chunk:
+        label = f"{_fmt_dt_wd(s.starts_at_utc)} · 👥 {s.booked}/{s.capacity}"
+        items.append((s.id, label))
+    kb = _book_slots_kb(week, page, total_pages, items)
+    try:
+        await cq.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        await cq.message.answer("⏰ Запись", reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is({"book_slot_pick"}))
+async def sui_book_slot_pick(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role="student")
+    week = int(payload.get("week", 0))
+    sid = int(payload.get("sid", 0))
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text="✅ Подтвердить",
+                callback_data=cb("book_slot_do", {"week": week, "sid": sid}),
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="Отмена", callback_data=cb("week_book", {"week": week})
+            )
+        ],
+        _nav_keyboard().inline_keyboard[0],
+    ]
+    kb = types.InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await cq.message.edit_text(
+            "Подтвердить запись на выбранный слот?", reply_markup=kb
+        )
+    except Exception:
+        await cq.message.answer(
+            "Подтвердить запись на выбранный слот?", reply_markup=kb
+        )
+    await cq.answer()
+
+
+@router.callback_query(_is({"book_slot_do"}))
+async def sui_book_slot_do(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    week = int(payload.get("week", 0))
+    sid = int(payload.get("sid", 0))
+    if not week or not sid:
+        return await _toast_error(cq, "E_INPUT_INVALID")
+    try:
+        bid = book_slot_for_week(actor.id, week, sid)
+    except BookingError as e:
+        return await _toast_error(cq, e.code)
+    # Audit
+    try:
+        audit.log(
+            "STUDENT_BOOKING_CREATE",
+            actor.id,
+            meta={"week": int(week), "slot_id": int(sid), "booking_id": int(bid)},
+        )
+    except Exception:
+        pass
+    try:
+        await cq.message.edit_text("✅ Запись создана", reply_markup=_nav_keyboard())
+    except Exception:
+        await cq.message.answer("✅ Запись создана", reply_markup=_nav_keyboard())
+    await cq.answer()
+
+
+@router.callback_query(_is({"week_unbook"}))
+async def sui_week_unbook(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    week = int(payload.get("week", 0))
+    if not week:
+        return await _toast_error(cq, "E_INPUT_INVALID")
+    src = str(payload.get("src", ""))
+    # Build pretty card about current booking (teacher + datetime)
+    with db() as conn:
+        row = conn.execute(
+            (
+                "SELECT e.slot_id, s.starts_at_utc, COALESCE(u.name, u.tg_id, '') AS teacher_name "
+                "FROM slot_enrollments e JOIN slots s ON s.id=e.slot_id "
+                "JOIN users u ON u.id=s.created_by "
+                "WHERE e.user_id=? AND e.week_no=? AND e.status='booked' LIMIT 1"
+            ),
+            (actor.id, week),
+        ).fetchone()
+    if not row:
+        return await _toast_error(cq, "E_NOT_FOUND", "⚠️ Активной записи не найдено")
+    _, starts, tname = int(row[0]), int(row[1]), str(row[2] or "Преподаватель")
+    title = dict(list_weeks_with_titles(limit=200)).get(
+        int(week), f"Неделя {int(week)}"
+    )
+    lines = [
+        "❓ <b>Отменить запись?</b>",
+        f"<b>{title}</b>",
+        f"🕒 <b>Когда:</b> {_fmt_dt_wd(starts)}",
+        f"🧑‍🏫 <b>Принимает:</b> {html.escape(tname)}",
+    ]
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text="🗑 Да, отменить", callback_data=cb("unbook_do", {"week": week})
+            )
+        ],
+        _nav_keyboard().inline_keyboard[0],
+    ]
+    kb = types.InlineKeyboardMarkup(inline_keyboard=rows)
+    text = "\n".join(lines)
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+    _stack_push(_uid(cq), "unbook_confirm", {"week": int(week), "src": src})
+
+
+@router.callback_query(_is({"unbook_do"}))
+async def sui_unbook_do(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    week = int(payload.get("week", 0))
+    if not week:
+        return await _toast_error(cq, "E_INPUT_INVALID")
+    try:
+        ok = cancel_week_booking(actor.id, week)
+    except BookingError as e:
+        return await _toast_error(cq, e.code)
+    if not ok:
+        return await _toast_error(
+            cq, "E_NOT_FOUND", "⚠️ У вас нет активной записи на эту неделю"
+        )
+    try:
+        audit.log("STUDENT_BOOKING_CANCEL", actor.id, meta={"week": int(week)})
+    except Exception:
+        pass
+    try:
+        await cq.message.edit_text("❌ Запись отменена", reply_markup=_nav_keyboard())
+    except Exception:
+        await cq.message.answer("❌ Запись отменена", reply_markup=_nav_keyboard())
+    await cq.answer()
+
+
+async def sui_list_my_bookings(cq: types.CallbackQuery, actor: Identity):
+    rows = list_active_bookings(actor.id)
+    if not rows:
+        text = "📅 Мои записи\n\n⚠️ Активных записей нет"
+        kb = _nav_keyboard()
+        try:
+            await cq.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await cq.message.answer(text, reply_markup=kb)
+        return await cq.answer()
+    buttons: list[list[types.InlineKeyboardButton]] = []
+    for w, sid, starts, tname in rows:
+        label = f"Неделя {int(w)} · {_fmt_dt_wd(starts)} · {tname or 'Преподаватель'}"
+        # In "Мои записи" clicking leads to cancel-confirm only
+        buttons.append(
+            [
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb("week_unbook", {"week": int(w), "src": "my"}),
+                )
+            ]
+        )
+    buttons.append(_nav_keyboard().inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=buttons)
+    text = "📅 Мои записи\nВыберите запись для подробностей/перезаписи."
+    try:
+        await cq.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb)
+    await cq.answer()
+    _stack_push(_uid(cq), "my_bookings", {})
+
+
+async def sui_list_history(cq: types.CallbackQuery, actor: Identity):
+    rows = list_history(actor.id)
+    if not rows:
+        text = "📜 История\n\n⚠️ У вас пока нет прошедших/отменённых записей"
+        kb = _nav_keyboard()
+        try:
+            await cq.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await cq.message.answer(text, reply_markup=kb)
+        return await cq.answer()
+    lines = ["📜 История"]
+    status_map = {
+        "canceled": "отменена",
+        "attended": "посещено",
+        "no_show": "не явился",
+    }
+    for w, sid, st, starts in rows[:50]:
+        lines.append(f"W{int(w):02d} · {_fmt_dt(starts)} · {status_map.get(st, st)}")
+    kb = _nav_keyboard()
+    text = "\n".join(lines)
+    try:
+        await cq.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb)
+    await cq.answer()
+
+
 # ------- Stubs for remaining actions -------
 
 
@@ -1024,7 +1399,7 @@ def _dev_stub_text() -> str:
     return "Функция в разработке"
 
 
-@router.callback_query(_is({"week_upload", "week_book", "week_unbook", "week_grade"}))
+@router.callback_query(_is({"week_upload", "week_grade"}))
 async def sui_other_week_action_stub(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "student":
         return await cq.answer("⛔ Доступ запрещён", show_alert=True)
@@ -1032,6 +1407,7 @@ async def sui_other_week_action_stub(cq: types.CallbackQuery, actor: Identity):
         callbacks.extract(cq.data, expected_role="student")
     except Exception:
         await _toast_error(cq, "E_STATE_EXPIRED")
+    # Only week_grade stays stub here
     try:
         await cq.message.edit_text(_dev_stub_text(), reply_markup=_nav_keyboard())
     except Exception:
@@ -1066,14 +1442,13 @@ async def sui_top_level_stub(cq: types.CallbackQuery, actor: Identity):
     except Exception:
         await _toast_error(cq, "E_STATE_EXPIRED")
         payload = {}
-    title_map = {
-        "my_bookings": "📅 Мои записи",
-        "my_grades": "📊 Мои оценки",
-        "history": "📜 История",
-    }
-    # Read intended action for header from extracted payload
-    header = title_map.get(str(payload.get("action")), "Заглушка")
-    text = f"{header}\n{_dev_stub_text()}"
+    action = str(payload.get("action"))
+    if action == "my_bookings":
+        return await sui_list_my_bookings(cq, actor)
+    if action == "history":
+        return await sui_list_history(cq, actor)
+    # grades still stub
+    text = "📊 Мои оценки\nФункция в разработке"
     kb = _nav_keyboard()
     try:
         await cq.message.edit_text(text, reply_markup=kb)

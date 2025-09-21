@@ -5,7 +5,7 @@ import os
 from aiogram import F, Router, types
 from aiogram.filters import Command
 
-from app.core import callbacks, state_store
+from app.core import audit, callbacks, state_store
 from app.core.auth import Identity
 from app.core.repos_epic4 import get_active_material, list_weeks_with_titles
 from app.core.slots_repo import create_slots_for_range, generate_timeslots
@@ -2482,12 +2482,113 @@ async def tui_sch_slot_del(cq: types.CallbackQuery, actor: Identity):
         return await cq.answer("Нет прав", show_alert=True)
     _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     slot_id = int(payload.get("id"))
+    # Collect affected enrollments and slot datetime, then cancel slot and enrollments
+    affected: list[tuple[int, str, int]] = []  # (enrollment_id, user_id, week_no)
+    starts_at_utc: int | None = None
     with db() as conn:
+        row = conn.execute(
+            "SELECT starts_at_utc FROM slots WHERE id=? AND created_by=?",
+            (slot_id, actor.id),
+        ).fetchone()
+        if not row:
+            return await _toast_error(cq, "E_NOT_FOUND", "⛔ Слот не найден")
+        starts_at_utc = int(row[0])
+        # Take snapshot of active enrollments before update
+        enr_rows = conn.execute(
+            (
+                "SELECT id, user_id, COALESCE(week_no, 0) FROM slot_enrollments "
+                "WHERE slot_id=? AND status='booked'"
+            ),
+            (slot_id,),
+        ).fetchall()
+        affected = [(int(r[0]), str(r[1]), int(r[2] or 0)) for r in enr_rows]
+        # Cancel the slot and associated active enrollments
         conn.execute(
             "UPDATE slots SET status='canceled' WHERE id=? AND created_by=?",
             (slot_id, actor.id),
         )
+        if affected:
+            conn.execute(
+                "UPDATE slot_enrollments SET status='canceled' WHERE slot_id=? AND status='booked'",
+                (slot_id,),
+            )
         conn.commit()
+
+    # Audit per enrollment and summary
+    for eid, uid, wno in affected:
+        try:
+            audit.log(
+                "STUDENT_BOOKING_AUTO_CANCEL",
+                actor.id,
+                object_type="slot_enrollment",
+                object_id=int(eid),
+                meta={
+                    "slot_id": int(slot_id),
+                    "week_no": int(wno),
+                    "reason": "slot_canceled",
+                },
+            )
+        except Exception:
+            pass
+    try:
+        audit.log(
+            "TEACHER_SLOT_CANCEL_NOTIFY",
+            actor.id,
+            object_type="slot",
+            object_id=int(slot_id),
+            meta={"affected": len(affected)},
+        )
+    except Exception:
+        pass
+
+    # Notify students about cancellation (best-effort)
+    if affected and starts_at_utc is not None:
+        try:
+            from app.services.common.time_service import format_dual_tz, get_course_tz
+
+            course_tz = get_course_tz()
+        except Exception:
+            course_tz = "UTC"
+            format_dual_tz = None  # type: ignore
+        for _eid, uid, _wno in affected:
+            tg_id: str | None = None
+            user_tz: str | None = None
+            try:
+                with db() as conn:
+                    urow = conn.execute(
+                        "SELECT tg_id, tz FROM users WHERE id=? AND role='student'",
+                        (uid,),
+                    ).fetchone()
+                if urow:
+                    tg_id = str(urow[0]) if urow[0] else None
+                    user_tz = str(urow[1]) if urow[1] else None
+            except Exception:
+                tg_id = None
+            if not tg_id:
+                continue
+            # Build message text
+            try:
+                if format_dual_tz is not None:
+                    dt_line = format_dual_tz(
+                        int(starts_at_utc), course_tz, user_tz or course_tz
+                    )
+                else:
+                    dt_line = f"{starts_at_utc} ({course_tz})"
+                msg = (
+                    "❗ Ваш слот отменён преподавателем\n"
+                    f"Дата/время: {dt_line}\n"
+                    "Причина: слот удалён.\n"
+                    "Вы можете выбрать другой слот в меню недели."
+                )
+                # send best-effort
+                try:
+                    bot = getattr(cq.message, "bot", None)
+                    if bot and hasattr(bot, "send_message"):
+                        await bot.send_message(tg_id, msg)
+                except Exception:
+                    pass
+            except Exception:
+                pass
     await cq.answer("🗑 Слот удалён")
     # Return to previous list if possible
     last_day = _stack_last_params(_uid(cq), "sch_manage_day")
