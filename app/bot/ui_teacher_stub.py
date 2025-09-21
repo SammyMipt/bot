@@ -33,6 +33,7 @@ ERROR_MESSAGES: dict[str, str] = {
     "E_ALREADY_EXISTS": "⚠️ Дубликат/конфликт",
     "E_ACCESS_DENIED": "⛔ Нет прав для действия",
     "E_STATE_INVALID": "⛔ Некорректное состояние",
+    "E_GRADE_INVALID_VALUE": "⛔ Некорректное значение оценки",
 }
 
 
@@ -151,11 +152,11 @@ def _main_menu_kb(role: str, uid: int) -> types.InlineKeyboardMarkup:
                 callback_data=cb("sch_manage", role=role),
             )
         ],
-        [
-            types.InlineKeyboardButton(
-                text="🧩 Мои пресеты", callback_data=cb("presets", role=role)
-            )
-        ],
+        # [
+        #     types.InlineKeyboardButton(
+        #         text="🧩 Мои пресеты", callback_data=cb("presets", role=role)
+        #     )
+        # ],
         [
             types.InlineKeyboardButton(
                 text="📚 Методические материалы",
@@ -712,28 +713,47 @@ async def tui_back(cq: types.CallbackQuery, actor: Identity):
     if screen == "sch_manage_all":
         return await tui_sch_manage_all(cq, actor)
     if screen == "sch_slot":
-        # Go back to the last list (day/all) if present
+        # Go back to the last list (day/all) if present; otherwise reopen slot card by id
         last_day = _stack_last_params(_uid(cq), "sch_manage_day") or _stack_last_params(
             _uid(cq), "sch_day"
         )
         if last_day:
-            # If we have a concrete picked day, return to that day view
             if set(last_day.keys()) >= {"y", "m", "d"}:
-                cq.data = cb(
-                    "sch_day",
-                    {"y": last_day["y"], "m": last_day["m"], "d": last_day["d"]},
-                    role=actor.role,
+                return await _render_sch_day(
+                    cq,
+                    actor,
+                    int(last_day["y"]),
+                    int(last_day["m"]),
+                    int(last_day["d"]),
                 )
-                return await tui_sch_day(cq, actor)
             return await tui_sch_manage_day(cq, actor)
         last_all = _stack_last_params(_uid(cq), "sch_manage_all")
         if last_all:
             return await tui_sch_manage_all(cq, actor)
+        last_slot = _stack_last_params(_uid(cq), "sch_slot") or {}
+        if "id" in last_slot:
+            return await _render_slot_card(cq, actor, int(last_slot["id"]))
         return await tui_sch_manage(cq, actor)
     if screen == "sch_slot_students":
-        return await tui_sch_slot(cq, actor)
+        # Reopen students list for the last slot id
+        last_ss = (
+            _stack_last_params(_uid(cq), "sch_slot_students")
+            or _stack_last_params(_uid(cq), "sch_slot")
+            or {}
+        )
+        if "id" in last_ss:
+            return await _render_slot_students(cq, actor, int(last_ss["id"]))
+        return await tui_sch_manage(cq, actor)
     if screen == "sch_slot_student":
-        return await tui_sch_slot_students(cq, actor)
+        # Go back to students list for the same slot
+        last_ss = (
+            _stack_last_params(_uid(cq), "sch_slot_students")
+            or _stack_last_params(_uid(cq), "sch_slot")
+            or {}
+        )
+        if "id" in last_ss:
+            return await _render_slot_students(cq, actor, int(last_ss["id"]))
+        return await tui_sch_manage(cq, actor)
     if screen == "presets":
         return await tui_presets(cq, actor)
     if screen == "presets_create":
@@ -748,6 +768,37 @@ async def tui_back(cq: types.CallbackQuery, actor: Identity):
         return await tui_cw_by_date(cq, actor)
     if screen == "cw_by_student":
         return await tui_cw_by_student(cq, actor)
+    if screen == "cw_weeks":
+        return await tui_cw_by_student(cq, actor)
+    if screen == "cw_week":
+        # reopen students list for stored week
+        last = _stack_last_params(_uid(cq), "cw_week") or {}
+        w = int(last.get("w", 0) or 0)
+        if w:
+            # Render students for week w
+            kb = _cw_students_by_week_kb(actor, int(w), page=0)
+            text = f"🔎 Неделя {int(w)} — студенты"
+            try:
+                await cq.message.edit_text(text, reply_markup=kb)
+            except Exception:
+                await cq.message.answer(text, reply_markup=kb)
+            await cq.answer()
+            return
+        return await tui_cw_by_student(cq, actor)
+    if screen == "cw_week_student":
+        # go back to students list for the same week
+        last = _stack_last_params(_uid(cq), "cw_week_student") or {}
+        w = int(last.get("w", 0) or 0)
+        if w:
+            kb = _cw_students_by_week_kb(actor, int(w), page=0)
+            text = f"🔎 Неделя {int(w)} — студенты"
+            try:
+                await cq.message.edit_text(text, reply_markup=kb)
+            except Exception:
+                await cq.message.answer(text, reply_markup=kb)
+            await cq.answer()
+            return
+        return await tui_cw_by_student(cq, actor)
     return await tui_home(cq, actor)
 
 
@@ -758,15 +809,15 @@ def _sch_create_kb(role: str) -> types.InlineKeyboardMarkup:
     rows = [
         [
             types.InlineKeyboardButton(
-                text="🧱 Создать слоты (на день)",
+                text="⏰ Создать слоты (на день)",
                 callback_data=cb("sch_manual", role=role),
             )
         ],
-        [
-            types.InlineKeyboardButton(
-                text="⚡ Применить пресет", callback_data=cb("sch_preset", role=role)
-            )
-        ],
+        # [
+        #     types.InlineKeyboardButton(
+        #         text="⚡ Применить пресет", callback_data=cb("sch_preset", role=role)
+        #     )
+        # ],
     ]
     rows.append(_nav_keyboard().inline_keyboard[0])
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1789,28 +1840,54 @@ def _month_name(dt) -> str:
     return names[int(dt.month) - 1]
 
 
-def _sch_days_kb(
-    role: str, page: int = 0, per_page: int = 8
+def _sch_list_unique_dates(actor: Identity) -> list[tuple[int, int, int]]:
+    from app.services.common.time_service import to_course_dt
+
+    dates: set[tuple[int, int, int]] = set()
+    with db() as conn:
+        rows = conn.execute(
+            (
+                "SELECT starts_at_utc FROM slots "
+                "WHERE created_by=? AND status IN ('open','closed') "
+                "ORDER BY starts_at_utc ASC"
+            ),
+            (actor.id,),
+        ).fetchall()
+    for r in rows:
+        dt = to_course_dt(int(r[0]))
+        dates.add((dt.year, dt.month, dt.day))
+    return sorted(dates)
+
+
+def _sch_days_kb_actor(
+    actor: Identity, page: int = 0, per_page: int = 8
 ) -> types.InlineKeyboardMarkup:
+    from datetime import date as _date
     from datetime import timedelta
 
     from app.services.common.time_service import course_today
 
-    base = course_today()
-    days = [base + timedelta(days=i) for i in range(0, 30)]
+    days = _sch_list_unique_dates(actor)
+    if not days:
+        base = course_today()
+        days = [
+            (d.year, d.month, d.day)
+            for d in [base + timedelta(days=i) for i in range(0, 30)]
+        ]
     total_pages = max(1, (len(days) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     start = page * per_page
     chunk = days[start : start + per_page]
     rows: list[list[types.InlineKeyboardButton]] = []
-    for d in chunk:
-        label = f"{_weekday_name(d)}, {d.day:02d} {_month_name(d)}"
+    for y, m, d in chunk:
+        dd = _date(y, m, d)
+        label = f"{_weekday_name(dd)}, {d:02d} {_month_name(dd)}"
         rows.append(
             [
                 types.InlineKeyboardButton(
                     text=label,
                     callback_data=cb(
-                        "sch_day", {"y": d.year, "m": d.month, "d": d.day}, role=role
+                        "sch_day", {"y": y, "m": m, "d": d}, role=actor.role
                     ),
                 )
             ]
@@ -1819,14 +1896,15 @@ def _sch_days_kb(
     if page > 0:
         nav.append(
             types.InlineKeyboardButton(
-                text="« Назад", callback_data=cb("sch_days", {"p": page - 1}, role=role)
+                text="« Назад",
+                callback_data=cb("sch_days", {"p": page - 1}, role=actor.role),
             )
         )
     if page < total_pages - 1:
         nav.append(
             types.InlineKeyboardButton(
                 text="Вперёд »",
-                callback_data=cb("sch_days", {"p": page + 1}, role=role),
+                callback_data=cb("sch_days", {"p": page + 1}, role=actor.role),
             )
         )
     if nav:
@@ -1835,7 +1913,7 @@ def _sch_days_kb(
         [
             types.InlineKeyboardButton(
                 text="🗓 Все слоты",
-                callback_data=cb("sch_manage_all", {"p": 0}, role=role),
+                callback_data=cb("sch_manage_all", {"p": 0}, role=actor.role),
             )
         ]
     )
@@ -1854,8 +1932,8 @@ async def tui_sch_manage(cq: types.CallbackQuery, actor: Identity):
     from app.services.common.time_service import get_course_tz
 
     tz = get_course_tz()
-    text = f"📅 <b>Управление расписанием</b>\nВыберите дату на ближайшие 30 дней.\n<i>Часовой пояс курса: {tz}</i>"
-    kb = _sch_days_kb(actor.role, page=0)
+    text = f"📅 <b>Управление расписанием</b>\nВыберите дату из доступных.\n<i>Часовой пояс курса: {tz}</i>"
+    kb = _sch_days_kb_actor(actor, page=0)
     try:
         await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
@@ -1870,7 +1948,7 @@ async def tui_sch_days(cq: types.CallbackQuery, actor: Identity):
         return await cq.answer("Нет прав", show_alert=True)
     _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     page = int(payload.get("p", 0))
-    kb = _sch_days_kb(actor.role, page=page)
+    kb = _sch_days_kb_actor(actor, page=page)
     try:
         await cq.message.edit_reply_markup(reply_markup=kb)
     except Exception:
@@ -1924,7 +2002,11 @@ def _format_dual_line(ts_utc: int, course_tz: str, user_tz: str | None) -> str:
 def _slot_list_for_date_text(
     actor: Identity, y: int, m: int, d: int
 ) -> tuple[str, types.InlineKeyboardMarkup]:
-    from app.services.common.time_service import get_course_tz, local_to_utc_ts
+    from app.services.common.time_service import (
+        get_course_tz,
+        local_to_utc_ts,
+        to_course_dt,
+    )
 
     course_tz = get_course_tz()
     start_utc = local_to_utc_ts(y, m, d, 0, 0, course_tz=course_tz)
@@ -1987,7 +2069,9 @@ def _slot_list_for_date_text(
         )
         del _location
         emoji = _slot_status_emoji(st_status, st, dur, booked, cap)
-        # Compact button: course time + optional local "ваш HH:MM", capacity and mode
+        # Button: date + course time + optional local "ваш HH:MM", capacity and mode
+        dtc = to_course_dt(st)
+        date_part = f"{dtc.day:02d} {_month_name(dtc)}"
         time_course = _format_hhmm(st, get_course_tz())
         time_local = (
             _format_hhmm(st, teacher_tz)
@@ -1997,7 +2081,7 @@ def _slot_list_for_date_text(
         local_part = f" • ваш {time_local}" if time_local else ""
         cap_part = f" 👥{booked}/{cap}"
         mode_part = f" {_mode_emoji(mode)}" if mode else ""
-        btn_text = f"{emoji} {time_course}{local_part}{cap_part}{mode_part}"
+        btn_text = f"{emoji} {date_part} {time_course}{local_part}{cap_part}{mode_part}"
         rows.append(
             [
                 types.InlineKeyboardButton(
@@ -2053,7 +2137,7 @@ async def tui_sch_manage_all(cq: types.CallbackQuery, actor: Identity):
     page = int(payload.get("p", 0))
     limit = 10
     offset = max(0, page) * limit
-    from app.services.common.time_service import get_course_tz, utc_now_ts
+    from app.services.common.time_service import get_course_tz, to_course_dt, utc_now_ts
 
     now = utc_now_ts()
     teacher_tz = _teacher_tz(actor)
@@ -2119,7 +2203,9 @@ async def tui_sch_manage_all(cq: types.CallbackQuery, actor: Identity):
         local_part = f" • ваш {time_local}" if time_local else ""
         cap_part = f" 👥{booked}/{cap}"
         mode_part = f" {_mode_emoji(mode)}" if mode else ""
-        btn_text = f"{emoji} {time_course}{local_part}{cap_part}{mode_part}"
+        dtc = to_course_dt(st)
+        date_part = f"{dtc.day:02d} {_month_name(dtc)}"
+        btn_text = f"{emoji} {date_part} {time_course}{local_part}{cap_part}{mode_part}"
         rows_btn.append(
             [
                 types.InlineKeyboardButton(
@@ -2323,23 +2409,50 @@ async def tui_sch_slot(cq: types.CallbackQuery, actor: Identity):
     _stack_push(_uid(cq), "sch_slot", {"id": slot_id})
 
 
-@router.callback_query(_is("t", {"sch_slot_students"}))
-async def tui_sch_slot_students(cq: types.CallbackQuery, actor: Identity):
-    if actor.role not in ("teacher", "owner"):
-        return await cq.answer("Нет прав", show_alert=True)
-    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
-    slot_id = int(payload.get("id"))
-    # List booked students for this slot
+async def _render_slot_card(
+    cq: types.CallbackQuery, actor: Identity, slot_id: int
+) -> None:
+    text, kb = _slot_card(_uid(cq), actor, slot_id)
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+
+
+async def _render_sch_day(
+    cq: types.CallbackQuery, actor: Identity, y: int, m: int, d: int
+) -> None:
+    text, kb = _slot_list_for_date_text(actor, int(y), int(m), int(d))
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+
+
+async def _render_slot_students(
+    cq: types.CallbackQuery, actor: Identity, slot_id: int
+) -> None:
+    # List booked students for this slot (helper shared by multiple flows)
     with db() as conn:
-        rows = conn.execute(
-            (
-                "SELECT u.id, COALESCE(u.name, u.tg_id) AS name "
+        # Detect optional group_name column in users
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "group_name" in ucols:
+            q = (
+                "SELECT u.id, COALESCE(u.name, u.tg_id) AS name, COALESCE(u.group_name,'') AS grp "
                 "FROM slot_enrollments e JOIN users u ON u.id = e.user_id "
                 "WHERE e.slot_id=? AND e.status='booked' AND u.role='student' "
                 "ORDER BY u.name"
-            ),
-            (slot_id,),
-        ).fetchall()
+            )
+        else:
+            q = (
+                "SELECT u.id, COALESCE(u.name, u.tg_id) AS name, '' AS grp "
+                "FROM slot_enrollments e JOIN users u ON u.id = e.user_id "
+                "WHERE e.slot_id=? AND e.status='booked' AND u.role='student' "
+                "ORDER BY u.name"
+            )
+        rows = conn.execute(q, (slot_id,)).fetchall()
     if not rows:
         text = "👨‍🎓 Студенты\n\n⛔ На этот слот никто не записан."
         kb = types.InlineKeyboardMarkup(
@@ -2356,21 +2469,26 @@ async def tui_sch_slot_students(cq: types.CallbackQuery, actor: Identity):
             await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
         except Exception:
             await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
-        await cq.answer()
-        _stack_push(_uid(cq), "sch_slot_students", {"id": slot_id})
         return
     # Build list
-    buttons = [
-        [
-            types.InlineKeyboardButton(
-                text=f"👤 {str(r[1])[:64]}",
-                callback_data=cb(
-                    "sch_slot_student", {"sid": slot_id, "uid": r[0]}, role=actor.role
-                ),
-            )
-        ]
-        for r in rows
-    ]
+    buttons = []
+    for r in rows:
+        uid = r[0]
+        name = str(r[1])[:64]
+        grp = str(r[2] or "").strip()
+        label = f"👤 {name}" + (f" — {grp}" if grp else "")
+        buttons.append(
+            [
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb(
+                        "sch_slot_student",
+                        {"sid": slot_id, "uid": uid},
+                        role=actor.role,
+                    ),
+                )
+            ]
+        )
     buttons.append(_nav_keyboard().inline_keyboard[0])
     kb = types.InlineKeyboardMarkup(inline_keyboard=buttons)
     text = "👨‍🎓 <b>Студенты слота</b>\nВыберите студента для карточки."
@@ -2378,6 +2496,16 @@ async def tui_sch_slot_students(cq: types.CallbackQuery, actor: Identity):
         await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    return
+
+
+@router.callback_query(_is("t", {"sch_slot_students"}))
+async def tui_sch_slot_students(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    slot_id = int(payload.get("id"))
+    await _render_slot_students(cq, actor, slot_id)
     await cq.answer()
     _stack_push(_uid(cq), "sch_slot_students", {"id": slot_id})
 
@@ -2389,33 +2517,333 @@ async def tui_sch_slot_student(cq: types.CallbackQuery, actor: Identity):
     _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     slot_id = int(payload.get("sid"))
     user_id = str(payload.get("uid"))
+    try:
+        from app.core import audit
+
+        audit.log(
+            "TEACHER_OPEN_STUDENT_CARD",
+            actor.id,
+            object_type="slot",
+            object_id=int(slot_id),
+            meta={"student_id": user_id},
+        )
+    except Exception:
+        pass
+    await _render_slot_student_card(cq, actor, slot_id, user_id)
+    await cq.answer()
+    _stack_push(_uid(cq), "sch_slot_student", {"sid": slot_id, "uid": user_id})
+
+
+async def _render_slot_student_card(
+    cq: types.CallbackQuery, actor: Identity, slot_id: int, user_id: str
+) -> None:
     with db() as conn:
-        row = conn.execute(
-            "SELECT id, name, tg_id FROM users WHERE id=? AND role='student'",
-            (user_id,),
-        ).fetchone()
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "group_name" in ucols:
+            row = conn.execute(
+                "SELECT id, name, tg_id, COALESCE(group_name,'') FROM users WHERE id=? AND role='student'",
+                (user_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id, name, tg_id, '' FROM users WHERE id=? AND role='student'",
+                (user_id,),
+            ).fetchone()
     if not row:
-        return await _toast_error(cq, "E_NOT_FOUND", "⛔ Студент не найден")
+        await _toast_error(cq, "E_NOT_FOUND", "⛔ Студент не найден")
+        return
     name = row[1] or row[2] or row[0]
-    text = f"👤 <b>{name}</b>\nКарточка студента в этом слоте. Заглушка: детали и действия будут добавлены."
-    kb = types.InlineKeyboardMarkup(
-        inline_keyboard=[
+    group_name = str(row[3] or "").strip()
+    # Determine week_no for this student's enrollment in the slot
+    week_no: int = 0
+    try:
+        with db() as conn:
+            cols = {
+                r[1]
+                for r in conn.execute("PRAGMA table_info(slot_enrollments)").fetchall()
+            }
+            if "week_no" in cols:
+                erow = conn.execute(
+                    (
+                        "SELECT COALESCE(week_no,0) FROM slot_enrollments WHERE slot_id=? AND user_id=? AND status='booked' LIMIT 1"
+                    ),
+                    (slot_id, user_id),
+                ).fetchone()
+                if erow:
+                    week_no = int(erow[0] or 0)
+    except Exception:
+        week_no = 0
+    # List files for week
+    from app.core.repos_epic4 import list_week_submission_files_for_teacher
+
+    files = list_week_submission_files_for_teacher(user_id, week_no) if week_no else []
+    # Determine current grade for this week
+    grade_str = "—"
+    if week_no:
+        try:
+            with db() as conn:
+                grow = conn.execute(
+                    (
+                        "SELECT grade FROM submissions WHERE student_id=? AND week_no=? ORDER BY id DESC LIMIT 1"
+                    ),
+                    (user_id, int(week_no)),
+                ).fetchone()
+            if grow and grow[0] is not None and str(grow[0]).strip() != "":
+                grade_str = str(grow[0]).strip()
+        except Exception:
+            grade_str = "—"
+    lines = ["👤 <b>Карточка студента</b>", f"<b>{name}</b>"]
+    lines.append(f"Группа: {group_name or '—'}")
+    if week_no:
+        lines.append(f"Неделя: {int(week_no)}")
+    if files:
+        lines.append(f"Файлов: {len(files)}")
+    else:
+        lines.append("Файлы: нет загрузок")
+    lines.append(f"📊 Оценка: {grade_str}")
+    text = "\n".join(lines)
+    # Build buttons: download all, per-file, grade
+    rows: list[list[types.InlineKeyboardButton]] = []
+    if files:
+        rows.append(
             [
                 types.InlineKeyboardButton(
-                    text="⬅️ Назад",
+                    text="📥 Скачать все",
                     callback_data=cb(
-                        "sch_slot_students", {"id": slot_id}, role=actor.role
+                        "cw_send_all",
+                        {"uid": user_id, "w": int(week_no)},
+                        role=actor.role,
                     ),
                 )
             ]
+        )
+        for f in files[:10]:  # limit inline list to 10 to keep UI compact
+            fname = os.path.basename(f["path"]) if f.get("path") else f"file_{f['id']}"
+            rows.append(
+                [
+                    types.InlineKeyboardButton(
+                        text=f"📄 {fname[:40]}",
+                        callback_data=cb(
+                            "cw_send_one", {"fid": int(f["id"])}, role=actor.role
+                        ),
+                    )
+                ]
+            )
+    if week_no:
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text="🧮 Выставить оценку",
+                    callback_data=cb(
+                        "cw_grade_open",
+                        {"uid": user_id, "w": int(week_no)},
+                        role=actor.role,
+                    ),
+                )
+            ]
+        )
+    rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=cb("sch_slot_students", {"id": slot_id}, role=actor.role),
+            )
         ]
     )
+    kb = types.InlineKeyboardMarkup(inline_keyboard=rows)
     try:
         await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    return
+
+
+@router.callback_query(_is("t", {"cw_send_one"}))
+async def tui_cw_send_one(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    fid = int(payload.get("fid"))
+    # Try canonical table first
+    path: str | None = None
+    try:
+        with db() as conn:
+            row = conn.execute(
+                "SELECT path FROM students_submissions WHERE id=? AND deleted_at_utc IS NULL",
+                (fid,),
+            ).fetchone()
+        if row and row[0]:
+            path = str(row[0])
+    except Exception:
+        path = None
+    if not path:
+        try:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT path FROM week_submission_files WHERE id=? AND deleted_at_utc IS NULL",
+                    (fid,),
+                ).fetchone()
+            if row and row[0]:
+                path = str(row[0])
+        except Exception:
+            path = None
+    if not path:
+        return await cq.answer("⛔ Файл не найден", show_alert=True)
+    if not BufferedInputFile:
+        return await cq.answer("⛔ Отправка файлов недоступна", show_alert=True)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        fname = os.path.basename(path) or f"submission_{fid}.bin"
+        await cq.message.answer_document(BufferedInputFile(data, filename=fname))
+    except Exception:
+        return await cq.answer("Не удалось отправить файл", show_alert=True)
+    await cq.answer("✅ Файл отправлен")
+
+
+@router.callback_query(_is("t", {"cw_send_all"}))
+async def tui_cw_send_all(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    uid = str(payload.get("uid"))
+    week = int(payload.get("w", 0))
+    from app.core.repos_epic4 import list_week_submission_files_for_teacher
+
+    files = list_week_submission_files_for_teacher(uid, week)
+    if not files:
+        return await cq.answer("Файлы отсутствуют", show_alert=True)
+    if not BufferedInputFile:
+        return await cq.answer("Отправка файлов недоступна", show_alert=True)
+    sent = 0
+    for f in files:
+        try:
+            with open(str(f["path"]), "rb") as h:
+                data = h.read()
+            fname = os.path.basename(str(f["path"])) or f"submission_{f['id']}.bin"
+            await cq.message.answer_document(BufferedInputFile(data, filename=fname))
+            sent += 1
+        except Exception:
+            continue
+    await cq.answer(f"✅ Отправлено файлов: {sent}")
+
+
+def _grade_kb(uid: str, week: int, role: str) -> types.InlineKeyboardMarkup:
+    rows: list[list[types.InlineKeyboardButton]] = []
+    # 1..10 as 2 rows of 5
+    for base in (1, 6):
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=str(i),
+                    callback_data=cb(
+                        "cw_grade_pick", {"uid": uid, "w": week, "g": i}, role=role
+                    ),
+                )
+                for i in range(base, base + 5)
+            ]
+        )
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is("t", {"cw_grade_open"}))
+async def tui_cw_grade_open(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    uid = str(payload.get("uid"))
+    week = int(payload.get("w", 0))
+    kb = _grade_kb(uid, week, actor.role)
+    try:
+        await cq.message.edit_text("Выберите оценку (1–10):", reply_markup=kb)
+    except Exception:
+        await cq.message.answer("Выберите оценку (1–10):", reply_markup=kb)
     await cq.answer()
-    _stack_push(_uid(cq), "sch_slot_student", {"sid": slot_id, "uid": user_id})
+
+
+@router.callback_query(_is("t", {"cw_grade_pick"}))
+async def tui_cw_grade_pick(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    uid = str(payload.get("uid"))
+    week = int(payload.get("w", 0))
+    grade = int(payload.get("g", 0))
+    rows = [
+        [
+            types.InlineKeyboardButton(
+                text="✅ Подтвердить",
+                callback_data=cb(
+                    "cw_grade_set", {"uid": uid, "w": week, "g": grade}, role=actor.role
+                ),
+            )
+        ],
+        [
+            types.InlineKeyboardButton(
+                text="Отмена",
+                callback_data=cb(
+                    "cw_grade_open", {"uid": uid, "w": week}, role=actor.role
+                ),
+            )
+        ],
+        _nav_keyboard().inline_keyboard[0],
+    ]
+    kb = types.InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await cq.message.edit_text(f"Поставить оценку: {grade}?", reply_markup=kb)
+    except Exception:
+        await cq.message.answer(f"Поставить оценку: {grade}?", reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is("t", {"cw_grade_set"}))
+async def tui_cw_grade_set(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    uid = str(payload.get("uid"))
+    week = int(payload.get("w", 0))
+    grade = int(payload.get("g", 0))
+    try:
+        from app.core.repos_epic4 import set_week_grade
+
+        set_week_grade(uid, week, actor.id, grade)
+        try:
+            audit.log(
+                "TEACHER_SET_GRADE",
+                actor.id,
+                object_type="grade",
+                object_id=None,
+                meta={"student_id": uid, "week_no": int(week), "score": int(grade)},
+            )
+        except Exception:
+            pass
+    except ValueError as e:
+        return await _toast_error(cq, str(e))
+    except Exception as e:
+        try:
+            audit.log(
+                "TEACHER_SET_GRADE_FAILED",
+                actor.id,
+                object_type="grade",
+                object_id=None,
+                meta={
+                    "student_id": uid,
+                    "week_no": int(week),
+                    "score": int(grade),
+                    "error": str(e),
+                },
+            )
+        except Exception:
+            pass
+        return await _toast_error(cq, "E_INPUT_INVALID", "Не удалось сохранить оценку")
+    await cq.answer("✅ Оценка выставлена")
+    # Optionally go back to student card; try to reopen from stack context
+    last = _stack_last_params(_uid(cq), "sch_slot_student") or {}
+    if set(last.keys()) >= {"sid", "uid"}:
+        await _render_slot_student_card(cq, actor, int(last["sid"]), str(last["uid"]))
+        await cq.answer()
 
 
 @router.callback_query(_is("t", {"sch_slot_toggle"}))
@@ -2905,7 +3333,8 @@ def _checkwork_kb(role: str) -> types.InlineKeyboardMarkup:
                 text="📅 По дате/слоту", callback_data=cb("cw_by_date", role=role)
             ),
             types.InlineKeyboardButton(
-                text="🔎 По студенту", callback_data=cb("cw_by_student", role=role)
+                text="🔎 По неделе и студенту",
+                callback_data=cb("cw_by_student", role=role),
             ),
         ],
         _nav_keyboard().inline_keyboard[0],
@@ -2938,28 +3367,272 @@ async def tui_cw_by_date(cq: types.CallbackQuery, actor: Identity):
         callbacks.extract(cq.data, expected_role=actor.role)
     except Exception:
         pass
-    text = "По дате/слоту. Заглушка: список дат/слотов не реализован."
-    rows = [
-        [
-            types.InlineKeyboardButton(
-                text="Сегодня", callback_data=cb("stub", role=actor.role)
-            ),
-            types.InlineKeyboardButton(
-                text="+1", callback_data=cb("stub", role=actor.role)
-            ),
-            types.InlineKeyboardButton(
-                text="🗓 Все даты", callback_data=cb("stub", role=actor.role)
-            ),
-        ],
-        _nav_keyboard().inline_keyboard[0],
-    ]
-    kb = types.InlineKeyboardMarkup(inline_keyboard=rows)
+    # Show unique dates with any slots for this teacher (past and future), paginated
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    kb = _cw_dates_page_kb(actor, page=0)
+    text = "🗓 Выбор даты для проверки работ"
     try:
         await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
     await cq.answer()
     _stack_push(_uid(cq), "cw_by_date", {})
+
+
+def _cw_list_unique_dates(actor: Identity) -> list[tuple[int, int, int]]:
+    """Return unique course-local dates (y,m,d) where the teacher has any slots."""
+    from app.services.common.time_service import to_course_dt
+
+    dates: set[tuple[int, int, int]] = set()
+    with db() as conn:
+        rows = conn.execute(
+            (
+                "SELECT starts_at_utc FROM slots "
+                "WHERE created_by=? AND status IN ('open','closed') "
+                "ORDER BY starts_at_utc ASC"
+            ),
+            (actor.id,),
+        ).fetchall()
+    for r in rows:
+        dt = to_course_dt(int(r[0]))
+        y, m, d = dt.year, dt.month, dt.day
+        dates.add((y, m, d))
+    return sorted(dates)
+
+
+def _cw_dates_page_kb(
+    actor: Identity, page: int = 0, per_page: int = 10
+) -> types.InlineKeyboardMarkup:
+    all_dates = _cw_list_unique_dates(actor)
+    if not all_dates:
+        return types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="Нет дат", callback_data=cb("checkwork", role=actor.role)
+                    )
+                ],
+                _nav_keyboard().inline_keyboard[0],
+            ]
+        )
+    total_pages = max(1, (len(all_dates) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = all_dates[start : start + per_page]
+    rows: list[list[types.InlineKeyboardButton]] = []
+    for y, m, d in chunk:
+        label = f"{d:02d}.{m:02d}.{y:04d}"
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb(
+                        "cw_date_pick", {"y": y, "m": m, "d": d}, role=actor.role
+                    ),
+                )
+            ]
+        )
+    nav: list[types.InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="« Назад",
+                callback_data=cb("cw_dates_page", {"p": page - 1}, role=actor.role),
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="Вперёд »",
+                callback_data=cb("cw_dates_page", {"p": page + 1}, role=actor.role),
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is("t", {"cw_dates_page"}))
+async def tui_cw_dates_page(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    page = int(payload.get("p", 0))
+    kb = _cw_dates_page_kb(actor, page=page)
+    try:
+        await cq.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        await cq.message.edit_text(
+            "🗓 Выбор даты для проверки работ", reply_markup=kb, parse_mode="HTML"
+        )
+    await cq.answer()
+
+
+def _cw_day_bounds_utc(y: int, m: int, d: int) -> tuple[int, int]:
+    from datetime import datetime, timedelta
+
+    try:
+        from zoneinfo import ZoneInfo
+
+        from app.services.common.time_service import get_course_tz
+
+        tz = ZoneInfo(get_course_tz())
+        start = datetime(y, m, d, 0, 0, 0, tzinfo=tz)
+        end = start + timedelta(days=1)
+        return int(start.timestamp()), int(end.timestamp())
+    except Exception:
+        # Fallback UTC naive
+        start = datetime(y, m, d, 0, 0, 0)
+        end = start + timedelta(days=1)
+        return int(start.timestamp()), int(end.timestamp())
+
+
+def _cw_slots_for_date_kb(
+    actor: Identity, y: int, m: int, d: int, page: int = 0, per_page: int = 10
+) -> types.InlineKeyboardMarkup:
+    from app.services.common.time_service import get_course_tz, to_course_dt
+
+    start_utc, end_utc = _cw_day_bounds_utc(y, m, d)
+    with db() as conn:
+        # Detect optional columns
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(slots)").fetchall()}
+        has_mode = "mode" in cols
+        has_location = "location" in cols
+        q = "SELECT s.id, s.starts_at_utc, s.duration_min, s.capacity, s.status"
+        if has_mode:
+            q += ", s.mode"
+        else:
+            q += ", NULL as mode"
+        if has_location:
+            q += ", s.location"
+        else:
+            q += ", NULL as location"
+        q += (
+            ", COALESCE(SUM(CASE WHEN e.status='booked' THEN 1 ELSE 0 END),0) AS booked "
+            "FROM slots s LEFT JOIN slot_enrollments e ON e.slot_id = s.id AND e.status='booked' "
+            "WHERE s.created_by=? AND s.starts_at_utc>=? AND s.starts_at_utc<? "
+            "GROUP BY s.id ORDER BY s.starts_at_utc ASC"
+        )
+        rows = conn.execute(q, (actor.id, start_utc, end_utc)).fetchall()
+    items = [
+        (
+            int(r[0]),
+            int(r[1]),
+            int(r[2]),
+            int(r[3]),
+            str(r[4]),
+            (str(r[5]) if r[5] is not None else ""),
+            int(r[7]),
+        )
+        for r in rows
+    ]  # (sid, st_utc, dur, cap, status, mode, booked)
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * per_page : page * per_page + per_page]
+    buttons: list[list[types.InlineKeyboardButton]] = []
+    teacher_tz = _teacher_tz(actor)
+    for sid, st_utc, dur, cap, status, mode, booked in chunk:
+        dtc = to_course_dt(st_utc)
+        # Build label similar to manage screen but include date+month
+        date_part = f"{dtc.day:02d} {_month_name(dtc)}"
+        time_course = _format_hhmm(st_utc, get_course_tz())
+        time_local = (
+            _format_hhmm(st_utc, teacher_tz)
+            if teacher_tz and teacher_tz != get_course_tz()
+            else None
+        )
+        local_part = f" • ваш {time_local}" if time_local else ""
+        cap_part = f" 👥{booked}/{cap}"
+        mode_emoji = "🖥" if mode == "online" else ("🏫" if mode == "offline" else "")
+        emoji = _slot_status_emoji(status, st_utc, dur, booked, cap)
+        label = f"{emoji} {date_part} {time_course}{local_part}{cap_part} {mode_emoji}".rstrip()
+        buttons.append(
+            [
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb(
+                        "cw_date_slot_pick",
+                        {"id": sid, "y": y, "m": m, "d": d},
+                        role=actor.role,
+                    ),
+                )
+            ]
+        )
+    nav: list[types.InlineKeyboardButton] = []
+    if total_pages > 1:
+        if page > 0:
+            nav.append(
+                types.InlineKeyboardButton(
+                    text="« Назад",
+                    callback_data=cb(
+                        "cw_date_slots_page",
+                        {"y": y, "m": m, "d": d, "p": page - 1},
+                        role=actor.role,
+                    ),
+                )
+            )
+        if page < total_pages - 1:
+            nav.append(
+                types.InlineKeyboardButton(
+                    text="Вперёд »",
+                    callback_data=cb(
+                        "cw_date_slots_page",
+                        {"y": y, "m": m, "d": d, "p": page + 1},
+                        role=actor.role,
+                    ),
+                )
+            )
+    if nav:
+        buttons.append(nav)
+    buttons.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.callback_query(_is("t", {"cw_date_pick"}))
+async def tui_cw_date_pick(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    y, m, d = int(payload.get("y")), int(payload.get("m")), int(payload.get("d"))
+    kb = _cw_slots_for_date_kb(actor, y, m, d, page=0)
+    text = f"📅 Слоты на {d:02d}.{m:02d}.{y:04d}"
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+
+
+@router.callback_query(_is("t", {"cw_date_slots_page"}))
+async def tui_cw_date_slots_page(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    y, m, d = int(payload.get("y")), int(payload.get("m")), int(payload.get("d"))
+    p = int(payload.get("p", 0))
+    kb = _cw_slots_for_date_kb(actor, y, m, d, page=p)
+    try:
+        await cq.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        text = f"📅 Слоты на {d:02d}.{m:02d}.{y:04d}"
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+
+
+@router.callback_query(_is("t", {"cw_date_slot_pick"}))
+async def tui_cw_date_slot_pick(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    sid = int(payload.get("id"))
+    # Render students list without mutating cq.data (Pydantic models are frozen)
+    await _render_slot_students(cq, actor, sid)
+    await cq.answer()
+    _stack_push(_uid(cq), "sch_slot_students", {"id": sid})
 
 
 @router.callback_query(_is("t", {"cw_by_student"}))
@@ -2970,18 +3643,296 @@ async def tui_cw_by_student(cq: types.CallbackQuery, actor: Identity):
         callbacks.extract(cq.data, expected_role=actor.role)
     except Exception:
         pass
-    uid = _uid(cq)
-    state_store.put_at(_cw_key(uid), "t_cw", {"mode": "await_surname"}, ttl_sec=600)
-    text = (
-        "По студенту. Введите фамилию текстом.\n"
-        "Заглушка: поиск и результаты — не реализовано."
-    )
+    # Show weeks list with pagination
+    kb = _cw_weeks_kb(page=0, role=actor.role)
+    text = "📘 Выберите неделю"
     try:
-        await cq.message.edit_text(text, reply_markup=_nav_keyboard())
+        await cq.message.edit_text(text, reply_markup=kb)
     except Exception:
-        await cq.message.answer(text, reply_markup=_nav_keyboard())
+        await cq.message.answer(text, reply_markup=kb)
     await cq.answer()
-    _stack_push(uid, "cw_by_student", {})
+    _stack_push(_uid(cq), "cw_weeks", {"p": 0})
+
+
+def _cw_weeks_kb(
+    page: int = 0, role: str | None = None, per_page: int = 10
+) -> types.InlineKeyboardMarkup:
+    items = list_weeks_with_titles(limit=500)
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    chunk = items[start : start + per_page]
+    rows: list[list[types.InlineKeyboardButton]] = []
+    for n, title in chunk:
+        label = f"📘 Неделя {int(n)}" + (f" — {title}" if title else "")
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb("cw_week_pick", {"w": int(n)}, role=role),
+                )
+            ]
+        )
+    nav: list[types.InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="« Назад",
+                callback_data=cb("cw_weeks_page", {"p": page - 1}, role=role),
+            )
+        )
+    if page < total_pages - 1:
+        nav.append(
+            types.InlineKeyboardButton(
+                text="Вперёд »",
+                callback_data=cb("cw_weeks_page", {"p": page + 1}, role=role),
+            )
+        )
+    if nav:
+        rows.append(nav)
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is("t", {"cw_weeks_page"}))
+async def tui_cw_weeks_page(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    p = int(payload.get("p", 0))
+    kb = _cw_weeks_kb(page=p, role=actor.role)
+    try:
+        await cq.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        await cq.message.edit_text("📘 Выберите неделю", reply_markup=kb)
+    await cq.answer()
+
+
+def _cw_students_by_week(teacher_id: str, week_no: int) -> list[tuple[str, str, str]]:
+    # Returns list of (student_id, display_name, group)
+    with db() as conn:
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "group_name" in ucols:
+            q = (
+                "SELECT u.id, COALESCE(u.name, u.tg_id, u.id) AS dname, COALESCE(u.group_name,'') AS grp "
+                "FROM teacher_student_assignments a JOIN users u ON u.id = a.student_id "
+                "WHERE a.teacher_id=? AND a.week_no=? AND u.role='student' "
+                "ORDER BY LOWER(COALESCE(u.name,'')) ASC, u.id ASC"
+            )
+        else:
+            q = (
+                "SELECT u.id, COALESCE(u.name, u.tg_id, u.id) AS dname, '' AS grp "
+                "FROM teacher_student_assignments a JOIN users u ON u.id = a.student_id "
+                "WHERE a.teacher_id=? AND a.week_no=? AND u.role='student' "
+                "ORDER BY LOWER(COALESCE(u.name,'')) ASC, u.id ASC"
+            )
+        rows = conn.execute(q, (teacher_id, int(week_no))).fetchall()
+    return [(str(r[0]), str(r[1]), str(r[2] or "")) for r in rows]
+
+
+def _cw_students_by_week_kb(
+    actor: Identity, week: int, page: int = 0, per_page: int = 10
+) -> types.InlineKeyboardMarkup:
+    items = _cw_students_by_week(actor.id, week)
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * per_page : page * per_page + per_page]
+    rows: list[list[types.InlineKeyboardButton]] = []
+    if not chunk:
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text="Никого", callback_data=cb("checkwork", role=actor.role)
+                )
+            ]
+        )
+    for uid, name, grp in chunk:
+        extra = f" — {grp}" if grp else ""
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text=f"👤 {name}{extra}",
+                    callback_data=cb(
+                        "cw_week_student", {"w": int(week), "uid": uid}, role=actor.role
+                    ),
+                )
+            ]
+        )
+    nav: list[types.InlineKeyboardButton] = []
+    if total_pages > 1:
+        if page > 0:
+            nav.append(
+                types.InlineKeyboardButton(
+                    text="« Назад",
+                    callback_data=cb(
+                        "cw_students_page",
+                        {"w": int(week), "p": page - 1},
+                        role=actor.role,
+                    ),
+                )
+            )
+        if page < total_pages - 1:
+            nav.append(
+                types.InlineKeyboardButton(
+                    text="Вперёд »",
+                    callback_data=cb(
+                        "cw_students_page",
+                        {"w": int(week), "p": page + 1},
+                        role=actor.role,
+                    ),
+                )
+            )
+    if nav:
+        rows.append(nav)
+    rows.append(_nav_keyboard().inline_keyboard[0])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(_is("t", {"cw_week_pick"}))
+async def tui_cw_week_pick(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    kb = _cw_students_by_week_kb(actor, week, page=0)
+    text = f"🔎 Неделя {int(week)} — студенты"
+    try:
+        await cq.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb)
+    await cq.answer()
+    _stack_push(_uid(cq), "cw_week", {"w": int(week)})
+
+
+@router.callback_query(_is("t", {"cw_students_page"}))
+async def tui_cw_students_page(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    p = int(payload.get("p", 0))
+    kb = _cw_students_by_week_kb(actor, week, page=p)
+    try:
+        await cq.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        await cq.message.edit_text(f"🔎 Неделя {int(week)} — студенты", reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is("t", {"cw_week_student"}))
+async def tui_cw_week_student(cq: types.CallbackQuery, actor: Identity):
+    if actor.role not in ("teacher", "owner"):
+        return await cq.answer("Нет прав", show_alert=True)
+    _, payload = callbacks.extract(cq.data, expected_role=actor.role)
+    week = int(payload.get("w", 0))
+    uid = str(payload.get("uid"))
+    await _render_student_week_card(cq, actor, week, uid)
+    await cq.answer()
+    _stack_push(_uid(cq), "cw_week_student", {"w": int(week), "uid": uid})
+
+
+async def _render_student_week_card(
+    cq: types.CallbackQuery, actor: Identity, week_no: int, user_id: str
+) -> None:
+    # Load student
+    with db() as conn:
+        ucols = {r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "group_name" in ucols:
+            row = conn.execute(
+                "SELECT id, name, tg_id, COALESCE(group_name,'') FROM users WHERE id=? AND role='student'",
+                (user_id,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id, name, tg_id, '' FROM users WHERE id=? AND role='student'",
+                (user_id,),
+            ).fetchone()
+    if not row:
+        await _toast_error(cq, "E_NOT_FOUND", "⛔ Студент не найден")
+        return
+    name = row[1] or row[2] or row[0]
+    group_name = str(row[3] or "").strip()
+    # Files and grade for selected week
+    from app.core.repos_epic4 import list_week_submission_files_for_teacher
+
+    files = list_week_submission_files_for_teacher(user_id, int(week_no))
+    grade_str = "—"
+    try:
+        with db() as conn:
+            grow = conn.execute(
+                (
+                    "SELECT grade FROM submissions WHERE student_id=? AND week_no=? ORDER BY id DESC LIMIT 1"
+                ),
+                (user_id, int(week_no)),
+            ).fetchone()
+        if grow and grow[0] is not None and str(grow[0]).strip() != "":
+            grade_str = str(grow[0]).strip()
+    except Exception:
+        pass
+    lines = [
+        "👤 <b>Карточка студента</b>",
+        f"<b>{name}</b>",
+        f"Группа: {group_name or '—'}",
+        f"Неделя: {int(week_no)}",
+    ]
+    if files:
+        lines.append(f"Файлов: {len(files)}")
+    else:
+        lines.append("Файлы: нет загрузок")
+    lines.append(f"📊 Оценка: {grade_str}")
+    text = "\n".join(lines)
+    # Build buttons
+    rows: list[list[types.InlineKeyboardButton]] = []
+    if files:
+        rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text="📥 Скачать все",
+                    callback_data=cb(
+                        "cw_send_all",
+                        {"uid": user_id, "w": int(week_no)},
+                        role=actor.role,
+                    ),
+                )
+            ]
+        )
+        for f in files[:10]:
+            fname = os.path.basename(f["path"]) if f.get("path") else f"file_{f['id']}"
+            rows.append(
+                [
+                    types.InlineKeyboardButton(
+                        text=f"📄 {fname[:40]}",
+                        callback_data=cb(
+                            "cw_send_one", {"fid": int(f["id"])}, role=actor.role
+                        ),
+                    )
+                ]
+            )
+    rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="🧮 Выставить оценку",
+                callback_data=cb(
+                    "cw_grade_open",
+                    {"uid": user_id, "w": int(week_no)},
+                    role=actor.role,
+                ),
+            )
+        ]
+    )
+    rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="⬅️ Назад",
+                callback_data=cb("cw_week_pick", {"w": int(week_no)}, role=actor.role),
+            )
+        ]
+    )
+    kb = types.InlineKeyboardMarkup(inline_keyboard=rows)
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 
 def _awaits_cw_surname(m: types.Message) -> bool:

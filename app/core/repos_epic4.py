@@ -828,3 +828,82 @@ def list_week_submission_files_for_teacher(student_id: str, week_no: int) -> Lis
             }
             for r in rows
         ]
+
+
+# ---------- GRADES (history + current in submissions) ----------
+
+
+def set_week_grade(
+    student_id: str,
+    week_no: int,
+    reviewer_id: str,
+    score_int: int,
+    *,
+    comment: Optional[str] = None,
+) -> None:
+    """Set/update a student's grade for a week.
+
+    - Validates score in [1..10]
+    - Ensures a submission row exists (creates if needed)
+    - Updates submissions.status='graded', submissions.grade=str(score_int), reviewed_by/at
+    - Appends a record into grades history table with previous score (if any)
+    """
+    if not (1 <= int(score_int) <= 10):
+        raise ValueError("E_GRADE_INVALID_VALUE")
+    from time import time as _time
+
+    now = int(_time())
+    with db() as conn:
+        # Ensure submission exists
+        row = conn.execute(
+            (
+                "SELECT id, grade FROM submissions WHERE student_id=? AND week_no=? ORDER BY id DESC LIMIT 1"
+            ),
+            (student_id, week_no),
+        ).fetchone()
+        subm_id: Optional[int] = int(row[0]) if row else None
+        prev_grade: Optional[str] = str(row[1]) if row and row[1] is not None else None
+        if subm_id is None:
+            cur = conn.execute(
+                (
+                    "INSERT INTO submissions(week_no, student_id, status, created_at_utc) "
+                    "VALUES(?, ?, 'submitted', strftime('%s','now'))"
+                ),
+                (week_no, student_id),
+            )
+            subm_id = int(cur.lastrowid)
+        # Update submission as graded
+        conn.execute(
+            (
+                "UPDATE submissions SET status='graded', grade=?, reviewed_by=?, reviewed_at_utc=? WHERE id=?"
+            ),
+            (str(int(score_int)), reviewer_id, now, subm_id),
+        )
+        # Insert grade history (best-effort): tolerate absence of the grades table
+        try:
+            try:
+                prev_int = (
+                    int(prev_grade) if prev_grade and prev_grade.isdigit() else None
+                )
+            except Exception:
+                prev_int = None
+            conn.execute(
+                (
+                    "INSERT INTO grades(student_id, week_no, score_int, graded_by, graded_at_utc, prev_score_int, comment, origin) "
+                    "VALUES(?,?,?,?,?,?,?,?)"
+                ),
+                (
+                    student_id,
+                    int(week_no),
+                    int(score_int),
+                    reviewer_id,
+                    now,
+                    prev_int,
+                    comment,
+                    "slot",
+                ),
+            )
+        except sqlite3.OperationalError:
+            # No grades table yet — skip history, keep submission updated
+            pass
+        conn.commit()
