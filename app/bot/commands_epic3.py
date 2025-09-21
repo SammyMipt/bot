@@ -58,7 +58,11 @@ async def whoami(msg: Message, actor: auth.Identity):
             (actor.tg_id,),
         ).fetchone()
     if not row:
-        text = f"<b>{actor.name or '(без имени)'}</b>\n<b>Роль:</b> {actor.role}\n<b>TG:</b> {'привязан' if actor.tg_id else 'не привязан'}"
+        text = (
+            f"<b>{actor.name or '(без имени)'}</b>\n"
+            f"<b>Роль:</b> {actor.role}\n"
+            f"<b>TG:</b> не привязан"
+        )
         return await msg.answer(text, parse_mode="HTML")
     role, name, email, group_name, capacity, tg_id, is_active = (
         row[0],

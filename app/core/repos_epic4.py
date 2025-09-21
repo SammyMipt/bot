@@ -498,6 +498,7 @@ def add_submission_file(
     Возвращает file_id, а при дубликате (тот же sha256+size, не удалённый) — существующий id.
     """
     with db() as conn:
+        # First, insert into legacy table (preserve API contract)
         try:
             cur = conn.execute(
                 """
@@ -506,15 +507,93 @@ def add_submission_file(
                 """,
                 (submission_id, sha256, size_bytes, path, mime),
             )
-            return cur.lastrowid
+            file_id = int(cur.lastrowid)
         except sqlite3.IntegrityError:
-            # Дубликат (UNIQUE по submission_id + sha256 + size_bytes для не удалённых)
+            return -1
+        # Mirror into students_submissions as the canonical store
+        try:
+            row = conn.execute(
+                "SELECT student_id, week_no FROM submissions WHERE id=?",
+                (submission_id,),
+            ).fetchone()
+            if row:
+                student_id, week_no = str(row[0]), int(row[1])
+                try:
+                    conn.execute(
+                        (
+                            "INSERT INTO students_submissions("
+                            "student_id, week_no, sha256, size_bytes, path, mime, created_at_utc) "
+                            "VALUES(?,?,?,?,?, ?, strftime('%s','now'))"
+                        ),
+                        (student_id, week_no, sha256, size_bytes, path, mime),
+                    )
+                except sqlite3.IntegrityError:
+                    # Duplicate per (student, week, sha256, size): keep legacy id return
+                    pass
+        except Exception:
+            # Table may not exist yet; ignore mirroring
+            pass
+        return file_id
+
+
+def add_student_submission_file(
+    student_id: str,
+    week_no: int,
+    sha256: str,
+    size_bytes: int,
+    path: str,
+    mime: Optional[str],
+) -> int:
+    """Вставка файла непосредственно в каноничную таблицу students_submissions.
+
+    Возвращает id созданной записи, при дубликате (по student_id, week_no, sha256, size) — -1.
+    """
+    with db() as conn:
+        try:
+            cur = conn.execute(
+                (
+                    "INSERT INTO students_submissions("
+                    "student_id, week_no, sha256, size_bytes, path, mime, created_at_utc) "
+                    "VALUES(?,?,?,?,?, ?, strftime('%s','now'))"
+                ),
+                (student_id, week_no, sha256, size_bytes, path, mime),
+            )
+            return int(cur.lastrowid)
+        except sqlite3.OperationalError:
+            # No table? Behave like duplicate to avoid crashing; caller may fall back.
+            return -1
+        except sqlite3.IntegrityError:
             return -1
 
 
 def list_submission_files(student_id: str, week_no: int) -> List[Dict]:
     """Файлы сдачи студента за неделю (только не удалённые)."""
     with db() as conn:
+        # Prefer canonical table if present
+        try:
+            rows = conn.execute(
+                (
+                    "SELECT id, sha256, size_bytes, path, mime, created_at_utc "
+                    "FROM students_submissions "
+                    "WHERE student_id=? AND week_no=? AND deleted_at_utc IS NULL "
+                    "ORDER BY id ASC"
+                ),
+                (student_id, week_no),
+            ).fetchall()
+            return [
+                {
+                    "id": int(r[0]),
+                    "sha256": r[1],
+                    "size_bytes": int(r[2]),
+                    "path": r[3],
+                    "mime": r[4],
+                    "created_at_utc": int(r[5]) if r[5] is not None else None,
+                }
+                for r in rows
+            ]
+        except Exception:
+            pass
+        # Fallback to legacy join
         rows = conn.execute(
             """
             SELECT f.id, f.sha256, f.size_bytes, f.path, f.mime, f.created_at_utc
@@ -525,17 +604,17 @@ def list_submission_files(student_id: str, week_no: int) -> List[Dict]:
             """,
             (student_id, week_no),
         ).fetchall()
-    return [
-        {
-            "id": r[0],
-            "sha256": r[1],
-            "size_bytes": r[2],
-            "path": r[3],
-            "mime": r[4],
-            "created_at_utc": r[5],
-        }
-        for r in rows
-    ]
+        return [
+            {
+                "id": r[0],
+                "sha256": r[1],
+                "size_bytes": r[2],
+                "path": r[3],
+                "mime": r[4],
+                "created_at_utc": r[5],
+            }
+            for r in rows
+        ]
 
 
 def soft_delete_submission_file(file_id: int, student_id: str) -> bool:
@@ -543,7 +622,7 @@ def soft_delete_submission_file(file_id: int, student_id: str) -> bool:
     with db() as conn:
         row = conn.execute(
             """
-            SELECT f.id
+            SELECT f.id, f.sha256, f.size_bytes, s.week_no
             FROM week_submission_files f
             JOIN submissions s ON s.id = f.submission_id
             WHERE f.id=? AND s.student_id=? AND f.deleted_at_utc IS NULL
@@ -556,7 +635,41 @@ def soft_delete_submission_file(file_id: int, student_id: str) -> bool:
             "UPDATE week_submission_files SET deleted_at_utc=strftime('%s','now') WHERE id=?",
             (file_id,),
         )
+        # Mirror deletion into canonical table
+        try:
+            sha256, size_bytes, week_no = str(row[1]), int(row[2]), int(row[3])
+            conn.execute(
+                (
+                    "UPDATE students_submissions SET deleted_at_utc=strftime('%s','now') "
+                    "WHERE student_id=? AND week_no=? AND sha256=? AND size_bytes=? AND deleted_at_utc IS NULL"
+                ),
+                (student_id, week_no, sha256, size_bytes),
+            )
+        except Exception:
+            pass
         return True
+
+
+def soft_delete_student_submission_file(file_id: int, student_id: str) -> bool:
+    """Мягкое удаление записи из students_submissions по id с проверкой студента."""
+    with db() as conn:
+        try:
+            row = conn.execute(
+                (
+                    "SELECT id FROM students_submissions "
+                    "WHERE id=? AND student_id=? AND deleted_at_utc IS NULL"
+                ),
+                (file_id, student_id),
+            ).fetchone()
+            if not row:
+                return False
+            conn.execute(
+                "UPDATE students_submissions SET deleted_at_utc=strftime('%s','now') WHERE id=?",
+                (file_id,),
+            )
+            return True
+        except sqlite3.OperationalError:
+            return False
 
 
 def list_student_weeks(student_id: str, limit: int = 20) -> List[Tuple[int, int]]:
@@ -617,6 +730,29 @@ def list_students_with_submissions_by_week(week_no: int) -> List[Dict]:
     Порядок детерминированный: по LOWER(name), затем по u.id.
     """
     with db() as conn:
+        # Prefer canonical table if present
+        try:
+            rows = conn.execute(
+                (
+                    "SELECT ss.student_id, u.tg_id, u.name, COUNT(ss.id) AS files_count "
+                    "FROM students_submissions ss JOIN users u ON u.id = ss.student_id "
+                    "WHERE ss.week_no=? AND ss.deleted_at_utc IS NULL "
+                    "GROUP BY ss.student_id, u.tg_id, u.name "
+                    "ORDER BY LOWER(COALESCE(u.name, '')) ASC, u.id ASC"
+                ),
+                (week_no,),
+            ).fetchall()
+            return [
+                {
+                    "student_id": r[0],
+                    "tg_id": r[1],
+                    "name": r[2],
+                    "files_count": int(r[3]),
+                }
+                for r in rows
+            ]
+        except Exception:
+            pass
         rows = conn.execute(
             """
             SELECT s.student_id,
@@ -633,20 +769,44 @@ def list_students_with_submissions_by_week(week_no: int) -> List[Dict]:
             """,
             (week_no,),
         ).fetchall()
-    return [
-        {
-            "student_id": r[0],
-            "tg_id": r[1],
-            "name": r[2],
-            "files_count": int(r[3]),
-        }
-        for r in rows
-    ]
+        return [
+            {
+                "student_id": r[0],
+                "tg_id": r[1],
+                "name": r[2],
+                "files_count": int(r[3]),
+            }
+            for r in rows
+        ]
 
 
 def list_week_submission_files_for_teacher(student_id: str, week_no: int) -> List[Dict]:
     """Файлы сдачи студента за неделю (только не удалённые)."""
     with db() as conn:
+        # Prefer canonical table
+        try:
+            rows = conn.execute(
+                (
+                    "SELECT id, sha256, size_bytes, path, mime, created_at_utc "
+                    "FROM students_submissions "
+                    "WHERE student_id=? AND week_no=? AND deleted_at_utc IS NULL "
+                    "ORDER BY id ASC"
+                ),
+                (student_id, week_no),
+            ).fetchall()
+            return [
+                {
+                    "id": int(r[0]),
+                    "sha256": r[1],
+                    "size_bytes": int(r[2]),
+                    "path": r[3],
+                    "mime": r[4],
+                    "created_at_utc": int(r[5]) if r[5] is not None else None,
+                }
+                for r in rows
+            ]
+        except Exception:
+            pass
         rows = conn.execute(
             """
             SELECT f.id, f.sha256, f.size_bytes, f.path, f.mime, f.created_at_utc
@@ -657,14 +817,93 @@ def list_week_submission_files_for_teacher(student_id: str, week_no: int) -> Lis
             """,
             (student_id, week_no),
         ).fetchall()
-    return [
-        {
-            "id": int(r[0]),
-            "sha256": r[1],
-            "size_bytes": int(r[2]),
-            "path": r[3],
-            "mime": r[4],
-            "created_at_utc": int(r[5]) if r[5] is not None else None,
-        }
-        for r in rows
-    ]
+        return [
+            {
+                "id": int(r[0]),
+                "sha256": r[1],
+                "size_bytes": int(r[2]),
+                "path": r[3],
+                "mime": r[4],
+                "created_at_utc": int(r[5]) if r[5] is not None else None,
+            }
+            for r in rows
+        ]
+
+
+# ---------- GRADES (history + current in submissions) ----------
+
+
+def set_week_grade(
+    student_id: str,
+    week_no: int,
+    reviewer_id: str,
+    score_int: int,
+    *,
+    comment: Optional[str] = None,
+) -> None:
+    """Set/update a student's grade for a week.
+
+    - Validates score in [1..10]
+    - Ensures a submission row exists (creates if needed)
+    - Updates submissions.status='graded', submissions.grade=str(score_int), reviewed_by/at
+    - Appends a record into grades history table with previous score (if any)
+    """
+    if not (1 <= int(score_int) <= 10):
+        raise ValueError("E_GRADE_INVALID_VALUE")
+    from time import time as _time
+
+    now = int(_time())
+    with db() as conn:
+        # Ensure submission exists
+        row = conn.execute(
+            (
+                "SELECT id, grade FROM submissions WHERE student_id=? AND week_no=? ORDER BY id DESC LIMIT 1"
+            ),
+            (student_id, week_no),
+        ).fetchone()
+        subm_id: Optional[int] = int(row[0]) if row else None
+        prev_grade: Optional[str] = str(row[1]) if row and row[1] is not None else None
+        if subm_id is None:
+            cur = conn.execute(
+                (
+                    "INSERT INTO submissions(week_no, student_id, status, created_at_utc) "
+                    "VALUES(?, ?, 'submitted', strftime('%s','now'))"
+                ),
+                (week_no, student_id),
+            )
+            subm_id = int(cur.lastrowid)
+        # Update submission as graded
+        conn.execute(
+            (
+                "UPDATE submissions SET status='graded', grade=?, reviewed_by=?, reviewed_at_utc=? WHERE id=?"
+            ),
+            (str(int(score_int)), reviewer_id, now, subm_id),
+        )
+        # Insert grade history (best-effort): tolerate absence of the grades table
+        try:
+            try:
+                prev_int = (
+                    int(prev_grade) if prev_grade and prev_grade.isdigit() else None
+                )
+            except Exception:
+                prev_int = None
+            conn.execute(
+                (
+                    "INSERT INTO grades(student_id, week_no, score_int, graded_by, graded_at_utc, prev_score_int, comment, origin) "
+                    "VALUES(?,?,?,?,?,?,?,?)"
+                ),
+                (
+                    student_id,
+                    int(week_no),
+                    int(score_int),
+                    reviewer_id,
+                    now,
+                    prev_int,
+                    comment,
+                    "slot",
+                ),
+            )
+        except sqlite3.OperationalError:
+            # No grades table yet — skip history, keep submission updated
+            pass
+        conn.commit()

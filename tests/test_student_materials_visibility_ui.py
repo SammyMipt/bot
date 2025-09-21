@@ -2,74 +2,28 @@ import asyncio
 import importlib
 import time
 
-import pytest
-
-pytestmark = pytest.mark.usefixtures("db_tmpdir")
-
 
 def _apply_materials_migrations_all():
     import app.db.conn as conn
-
-    # Ensure legacy base if needed (assignments required by 005 backfill)
-    with conn.db() as c:
-        tables = {
-            r[0]
-            for r in c.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-    if "assignments" not in tables:
-        # Create minimal legacy table required by 005 backfill without touching existing schema
-        with conn.db() as c:
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS assignments (id INTEGER PRIMARY KEY AUTOINCREMENT, week_no INTEGER)"
-            )
-            c.commit()
 
     with conn.db() as c:
         cols = {r[1] for r in c.execute("PRAGMA table_info(weeks)").fetchall()}
         need_004 = "topic" not in cols
 
-    # 004: add weeks.topic if needed
+    migrations = []
     if need_004:
-        with open("migrations/004_course_weeks_schema.sql", "r", encoding="utf-8") as f:
+        migrations.append("migrations/004_course_weeks_schema.sql")
+    migrations += [
+        "migrations/005_rewire_materials_weeks.sql",
+        "migrations/007_materials_versions.sql",
+        "migrations/008_materials_hash_scope.sql",
+    ]
+    for m in migrations:
+        with open(m, "r", encoding="utf-8") as f:
             sql = f.read()
         with conn.db() as c:
             c.executescript(sql)
             c.commit()
-
-    # Inspect materials table to decide on 005/007
-    with conn.db() as c:
-        cols_m = {r[1] for r in c.execute("PRAGMA table_info(materials)").fetchall()}
-
-    # 005: rewire to week_id — only if not yet applied
-    if "week_id" not in cols_m:
-        with open(
-            "migrations/005_rewire_materials_weeks.sql", "r", encoding="utf-8"
-        ) as f:
-            sql = f.read()
-        with conn.db() as c:
-            c.executescript(sql)
-            c.commit()
-        with conn.db() as c:
-            cols_m = {
-                r[1] for r in c.execute("PRAGMA table_info(materials)").fetchall()
-            }
-
-    # 007: add versioning/type columns if missing
-    if not {"type", "is_active", "version"}.issubset(cols_m):
-        with open("migrations/007_materials_versions.sql", "r", encoding="utf-8") as f:
-            sql = f.read()
-        with conn.db() as c:
-            c.executescript(sql)
-            c.commit()
-
-    # 008: adjust hash scope (idempotent)
-    with open("migrations/008_materials_hash_scope.sql", "r", encoding="utf-8") as f:
-        sql = f.read()
-    with conn.db() as c:
-        c.executescript(sql)
-        c.commit()
 
 
 def _install_aiogram_stub(monkeypatch):
@@ -166,6 +120,11 @@ class StubMessage:
     ):
         self._answers.append((text, reply_markup, parse_mode))
 
+    async def edit_text(
+        self, text: str, reply_markup: object = None, parse_mode: str | None = None
+    ):
+        self._answers.append((text, reply_markup, parse_mode))
+
     async def answer_document(
         self,
         document: object,
@@ -176,8 +135,8 @@ class StubMessage:
         self._docs.append((document, caption, parse_mode))
 
     @property
-    def markups(self) -> list[object]:
-        return [m for _, m, _ in self._answers]
+    def answers(self) -> list[tuple[str, object, str | None]]:
+        return self._answers
 
     @property
     def documents(self) -> list[tuple[object, str | None, str | None]]:
@@ -199,7 +158,7 @@ class StubCallbackQuery:
         return self._alerts
 
 
-def _identity(tg_id: str, role: str = "teacher"):
+def _identity(tg_id: str, role: str = "student"):
     from app.core.auth import Identity
     from app.db.conn import db
 
@@ -213,24 +172,31 @@ def _run(awaitable):
     return asyncio.run(awaitable)
 
 
-def _seed_teacher_and_week():
+def _seed_student_teacher_and_week_with_materials(teacher_only: bool):
     from app.core.files import save_blob
     from app.core.repos_epic4 import insert_week_material_file
     from app.db.conn import db
 
     now = int(time.time())
     with db() as conn:
+        # student
         conn.execute(
-            "INSERT OR IGNORE INTO users(tg_id, role, name, created_at_utc, updated_at_utc) VALUES('123','teacher','Teacher',?,?)",
+            "INSERT OR IGNORE INTO users(tg_id, role, name, created_at_utc, updated_at_utc) VALUES('s-1','student','Student One',?,?)",
             (now, now),
         )
-        row = conn.execute("SELECT id FROM users WHERE tg_id='123'").fetchone()
+        # teacher (uploader)
+        conn.execute(
+            "INSERT OR IGNORE INTO users(tg_id, role, name, created_at_utc, updated_at_utc) VALUES('t-1','teacher','Teacher One',?,?)",
+            (now, now),
+        )
+        row = conn.execute("SELECT id FROM users WHERE tg_id='t-1'").fetchone()
         tid = row[0]
         conn.execute(
             "INSERT OR IGNORE INTO weeks(week_no, title, created_at_utc) VALUES(1,'Week 1',?)",
             (now,),
         )
         conn.commit()
+    # create blob and material
     blob = save_blob(b"data", prefix="materials", suggested_name="demo.txt")
     insert_week_material_file(
         1,
@@ -239,42 +205,31 @@ def _seed_teacher_and_week():
         blob.sha256,
         blob.size_bytes,
         "text/plain",
-        visibility="public",
+        visibility="teacher_only" if teacher_only else "public",
         type="p",
         original_name="demo.txt",
     )
 
 
-def test_teacher_materials_flow(monkeypatch):
+def test_student_cannot_access_teacher_only_material(monkeypatch, db_tmpdir):
     from app.core import callbacks
 
-    _apply_materials_migrations_all()
     _install_aiogram_stub(monkeypatch)
-    _seed_teacher_and_week()
+    _apply_materials_migrations_all()
+    _seed_student_teacher_and_week_with_materials(teacher_only=True)
 
-    from app.bot import ui_teacher_stub as teacher
+    from app.bot import ui_student_stub as student
 
-    importlib.reload(teacher)
+    importlib.reload(student)
 
-    user = StubUser(123, full_name="Teacher")
+    user = StubUser(1001, full_name="Student")
     m = StubMessage(user)
-    ident = _identity("123", role="teacher")
+    ident = _identity("s-1", role="student")
 
-    cb_root = callbacks.build("t", {"action": "materials"}, role="teacher")
-    _run(teacher.tui_materials(StubCallbackQuery(cb_root, user, m), ident))
-    markup = m.markups[-1]
-    btn_texts = [b.text for row in markup.inline_keyboard for b in row]
-    assert any("Неделя 1" in t for t in btn_texts)
+    # Try to retrieve prep materials (type 'p') for week 1
+    cb = callbacks.build("s", {"action": "week_prep", "week": 1}, role="student")
+    cq = StubCallbackQuery(cb, user, m)
+    _run(student.sui_week_send_prep(cq, ident))
 
-    cb_week = callbacks.build(
-        "t", {"action": "materials_week", "week": 1}, role="teacher"
-    )
-    _run(teacher.tui_materials_week(StubCallbackQuery(cb_week, user, m), ident))
-
-    cb_send = callbacks.build(
-        "t", {"action": "materials_send", "week": 1, "t": "p"}, role="teacher"
-    )
-    cq_send = StubCallbackQuery(cb_send, user, m)
-    _run(teacher.tui_materials_send(cq_send, ident))
-    assert m.documents
-    assert any("Файл отправлен" in t for t, _ in cq_send.alerts)
+    # Expect a toast alert about not found (visibility enforced)
+    assert any("Не найдено" in t for t, alert in cq.alerts if alert)

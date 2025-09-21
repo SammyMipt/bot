@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from aiogram import F, Router, types
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command
 
 from app.core import audit, callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
@@ -532,6 +532,32 @@ async def owner_menu_cmd(m: types.Message, actor: Identity):
     await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
 
 
+# Explicit stop of impersonation via command
+@router.message(Command("stop"))
+async def owner_stop_impersonation_cmd(
+    m: types.Message, actor: Identity, principal: Identity | None = None
+):
+    # Allow when actor is owner OR real principal is owner (impersonation)
+    is_owner = actor.role == "owner" or (principal and principal.role == "owner")
+    if not is_owner:
+        return await m.answer("⛔ Доступ запрещён.")
+    uid = _uid(m)
+    # Clear impersonation token (idempotent)
+    try:
+        state_store.delete(_imp_key(uid))
+    except Exception:
+        pass
+    try:
+        audit.log("OWNER_IMPERSONATE_STOP", actor.id, meta={"via": "command"})
+    except Exception:
+        pass
+    # Reset UI stack and show owner main menu
+    _stack_reset(uid)
+    banner = await _maybe_banner(uid)
+    await m.answer(banner + "Имперсонизация завершена.")
+    await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
+
+
 @router.message(Command("owner_menu"))
 async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
     if actor.role != "owner":
@@ -542,36 +568,8 @@ async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
     await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
 
 
-@router.message(CommandStart())
-async def owner_menu_on_start(m: types.Message, actor: Identity):
-    # Only handle owners here; others are handled by registration router
-    if actor.role != "owner":
-        return
-    uid = _uid(m)
-    # If owner also configured as teacher → offer a role chooser per docs
-    if _owner_has_teacher_cap(actor.id):
-        kb = types.InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    types.InlineKeyboardButton(
-                        text="👑 Главное меню владельца",
-                        callback_data=cb("start_owner"),
-                    )
-                ],
-                [
-                    types.InlineKeyboardButton(
-                        text="📚 Главное меню преподавателя",
-                        callback_data=cb("start_teacher"),
-                    )
-                ],
-            ]
-        )
-        await m.answer("Выберите раздел:", reply_markup=kb)
-        return
-    # Default: open owner main menu
-    _stack_reset(uid)
-    banner = await _maybe_banner(uid)
-    await m.answer(banner + "Главное меню", reply_markup=_main_menu_kb())
+# Note: /start is handled by the registration router only.
+# Owner can open main menu via /owner or /owner_menu.
 
 
 def _owner_has_teacher_cap(user_id: str) -> bool:
@@ -983,13 +981,15 @@ async def ownui_course_tz_set(cq: types.CallbackQuery, actor: Identity):
 
     with db() as conn:
         now = utc_now_ts()
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO course(id, name, created_at_utc, updated_at_utc, tz) VALUES(1, 'Course', ?, ?, ?)",
-                (now, now, tzname),
+        row = conn.execute("SELECT id FROM course WHERE id=1").fetchone()
+        if not row:
+            # Require explicit course creation via name before TZ can be set
+            await cq.message.answer(
+                "⛔ Сначала введите название курса",
+                reply_markup=_nav_keyboard("course"),
             )
-        except Exception:
-            pass
+            await cq.answer()
+            return
         conn.execute(
             "UPDATE course SET tz=?, updated_at_utc=? WHERE id=1", (tzname, now)
         )
@@ -1288,13 +1288,14 @@ async def ownui_course_init_tz_set(cq: types.CallbackQuery, actor: Identity):
 
     with db() as conn:
         now = utc_now_ts()
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO course(id, name, created_at_utc, updated_at_utc, tz) VALUES(1, 'Course', ?, ?, ?)",
-                (now, now, tzname),
+        row = conn.execute("SELECT id FROM course WHERE id=1").fetchone()
+        if not row:
+            await cq.message.answer(
+                "⛔ Сначала введите название курса",
+                reply_markup=_nav_keyboard("course"),
             )
-        except Exception:
-            pass
+            await cq.answer()
+            return
         conn.execute(
             "UPDATE course SET tz=?, updated_at_utc=? WHERE id=1", (tzname, now)
         )
@@ -3524,8 +3525,71 @@ async def ownui_impersonation_menus(cq: types.CallbackQuery, actor: Identity):
                 reply_markup=kb,
             )
         return await cq.answer()
-    # Student menu not implemented yet
-    await cq.answer("⛔ Функция не реализована", show_alert=True)
+    # Student main menu (impersonation)
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="📘 Работа с неделями",
+                    callback_data=callbacks.build(
+                        "s", {"action": "weeks"}, role="student"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📅 Мои записи",
+                    callback_data=callbacks.build(
+                        "s", {"action": "my_bookings"}, role="student"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📊 Мои оценки",
+                    callback_data=callbacks.build(
+                        "s", {"action": "my_grades"}, role="student"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="📜 История",
+                    callback_data=callbacks.build(
+                        "s", {"action": "history"}, role="student"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="👑 Меню владельца",
+                    callback_data=callbacks.build(
+                        "own", {"action": "start_owner"}, role="owner"
+                    ),
+                )
+            ],
+            [
+                types.InlineKeyboardButton(
+                    text="↩️ Завершить имперсонизацию",
+                    callback_data=callbacks.build(
+                        "own", {"action": "imp_stop"}, role="owner"
+                    ),
+                )
+            ],
+        ]
+    )
+    banner = await _maybe_banner(_uid(cq))
+    try:
+        await cq.message.edit_text(
+            banner + "🎓 Главное меню студента (имперсонизация)",
+            reply_markup=kb,
+        )
+    except Exception:
+        await cq.message.answer(
+            banner + "🎓 Главное меню студента (имперсонизация)",
+            reply_markup=kb,
+        )
+    return await cq.answer()
 
 
 @router.callback_query(_is("own", {"imp_confirm"}))

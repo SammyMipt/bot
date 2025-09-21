@@ -4,7 +4,7 @@ import logging
 import re
 
 from aiogram import F, Router, types
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 
 from app.core import callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
@@ -87,8 +87,29 @@ def _eff_tg_id(raw_id: int) -> str:
 
 @router.message(CommandStart())
 async def start(m: types.Message, actor: Identity):
+    log.info(
+        "/start entered: tg=%s role=%s", m.from_user.id, getattr(actor, "role", None)
+    )
+    # Maintenance gate: tie to course initialization, not users table.
+    # Consider initialized when there's a row in course (id=1). No placeholders are created by migrations now.
+    try:
+        with db() as conn:
+            course_row = conn.execute("SELECT 1 FROM course WHERE id=1").fetchone()
+    except Exception:
+        course_row = None
+    tg_eff = _eff_tg_id(m.from_user.id)
+    if not course_row:
+        # Allow only configured owner to proceed (owner handler will pick it up). Block everyone else.
+        if tg_eff in cfg.telegram_owner_ids:
+            log.info(
+                "/start: course not initialized; owner tg=%s allowed to proceed", tg_eff
+            )
+            return
+        log.info("/start: course not initialized; block tg=%s", tg_eff)
+        await m.answer("🧱 Курс не инициализован. Ведутся технические работы")
+        return
     # If already registered (tg_id bound), greet and show role quick menu
-    existing = get_user_by_tg(_eff_tg_id(m.from_user.id))
+    existing = get_user_by_tg(tg_eff)
     if existing:
         role = existing.role
         await m.answer(
@@ -103,6 +124,43 @@ async def start(m: types.Message, actor: Identity):
         "Выберите роль для регистрации:",
         reply_markup=_start_keyboard(actor.role),
     )
+
+
+@router.message(Command("start"))
+async def start_cmd(m: types.Message, actor: Identity):
+    await start(m, actor)
+
+
+@router.message(Command("register"))
+async def register_cmd(m: types.Message, actor: Identity):
+    await start(m, actor)
+
+
+# Fallbacks for clients sending plain text
+def _is_start_text(m: types.Message) -> bool:
+    try:
+        t = (m.text or "").strip()
+        return t.startswith("/start")
+    except Exception:
+        return False
+
+
+@router.message(F.text, _is_start_text)
+async def start_text_fallback(m: types.Message, actor: Identity):
+    await start(m, actor)
+
+
+def _is_register_text(m: types.Message) -> bool:
+    try:
+        t = (m.text or "").strip()
+        return t.startswith("/register")
+    except Exception:
+        return False
+
+
+@router.message(F.text, _is_register_text)
+async def register_text_fallback(m: types.Message, actor: Identity):
+    await start(m, actor)
 
 
 @router.callback_query(_op("reg_menu"))
@@ -180,10 +238,24 @@ def _has_mode(uid: int, mode: str) -> bool:
     return bool(st and st.get("mode") == mode)
 
 
-@router.message(F.text)
+def _awaits_reg_text(m: types.Message) -> bool:
+    try:
+        st = _safe_get(_reg_key(m.from_user.id)) or {}
+        role = st.get("role")
+        step = st.get("step")
+        # Expect plain text for teacher code or student email
+        return (role == "t" and step == "code") or (role == "s" and step == "email")
+    except Exception:
+        return False
+
+
+@router.message(F.text, _awaits_reg_text)
 async def reg_input_text(m: types.Message, actor: Identity):
     if get_user_by_tg(_eff_tg_id(m.from_user.id)):
         return  # already registered; ignore
+    # Ignore commands starting with '/'
+    if (m.text or "").strip().startswith("/"):
+        return
     uid = _uid(m)
     st = _safe_get(_reg_key(uid)) or {}
     role = st.get("role")
