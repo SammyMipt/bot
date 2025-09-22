@@ -233,16 +233,35 @@ def list_active_bookings(student_id: str) -> Sequence[tuple[int, int, int, str]]
         return [(int(r[0] or 0), int(r[1]), int(r[2]), str(r[3] or "")) for r in rows]
 
 
-def list_history(student_id: str) -> Sequence[tuple[int, int, str, int]]:
-    """Return (week_no, slot_id, status, starts_at_utc) for non-active enrollments."""
+def list_history(student_id: str) -> Sequence[tuple[int, int, str, int | None, str]]:
+    """
+    Return (week_no, slot_id, status, starts_at_utc, teacher_name) for historical enrollments.
+
+    Includes canceled slots plus bookings whose slot time is in the past (even if status
+    remains "booked"). Teacher name falls back to tg_id when display name is missing so the
+    UI can always render something meaningful.
+    """
+
     with db() as conn:
         rows = conn.execute(
             (
-                "SELECT e.week_no, e.slot_id, e.status, s.starts_at_utc "
-                "FROM slot_enrollments e JOIN slots s ON s.id=e.slot_id "
-                "WHERE e.user_id=? AND e.status!='booked' "
+                "SELECT e.week_no, e.slot_id, e.status, s.starts_at_utc, "
+                "       COALESCE(u.name, u.tg_id, '') AS teacher_name "
+                "FROM slot_enrollments e "
+                "JOIN slots s ON s.id = e.slot_id "
+                "LEFT JOIN users u ON u.id = s.created_by "
+                "WHERE e.user_id = ? AND e.status IN ('canceled','attended','no_show','booked') "
                 "ORDER BY s.starts_at_utc DESC"
             ),
             (student_id,),
         ).fetchall()
-        return [(int(r[0] or 0), int(r[1]), str(r[2]), int(r[3])) for r in rows]
+        return [
+            (
+                int(r[0] or 0),
+                int(r[1]),
+                str(r[2]),
+                int(r[3]) if r[3] is not None else None,
+                str(r[4] or ""),
+            )
+            for r in rows
+        ]

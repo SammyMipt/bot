@@ -1486,23 +1486,36 @@ async def sui_list_my_bookings(cq: types.CallbackQuery, actor: Identity):
 async def sui_list_history(cq: types.CallbackQuery, actor: Identity):
     rows = list_history(actor.id)
     if not rows:
-        text = "📜 История\n\n⚠️ У вас пока нет прошедших/отменённых записей"
+        text = "📜 История\n\n⚠️ У вас пока нет прошедших или отменённых записей"
         kb = _nav_keyboard()
         try:
             await cq.message.edit_text(text, reply_markup=kb)
         except Exception:
             await cq.message.answer(text, reply_markup=kb)
         return await cq.answer()
+
+    grades_map = list_student_grades(actor.id)
+    now_ts = utc_now_ts()
     lines = ["📜 История"]
-    status_map = {
-        "canceled": "отменена",
-        "attended": "посещено",
-        "no_show": "не явился",
-    }
-    for w, sid, st, starts in rows[:50]:
-        lines.append(f"Неделя {int(w)} · {_fmt_dt(starts)} · {status_map.get(st, st)}")
+    for week_no, _slot_id, status, starts_at, teacher_name in rows:
+        if status != "canceled" and starts_at and starts_at > now_ts:
+            continue
+        label = f"Неделя {int(week_no)}"
+        dt_line = _fmt_dt(starts_at) if starts_at else "—"
+        teacher = teacher_name.strip() or "Преподаватель"
+        status_text = "отменена" if status == "canceled" else "завершилась"
+        grade_raw = grades_map.get(int(week_no))
+        grade = grade_raw.strip() if isinstance(grade_raw, str) else grade_raw
+        line = f"{label} — {dt_line}, {teacher}, {status_text}"
+        if status_text == "завершилась" and grade:
+            line += f" (оценка: {grade})"
+        lines.append(line)
+
+    if len(lines) == 1:
+        lines.append("⚠️ У вас пока нет прошедших или отменённых записей")
+
     kb = _nav_keyboard()
-    text = "\n".join(lines)
+    text = "\n".join(lines[:51])
     try:
         await cq.message.edit_text(text, reply_markup=kb)
     except Exception:
