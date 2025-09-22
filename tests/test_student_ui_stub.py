@@ -188,11 +188,12 @@ def test_student_main_menu_and_weeks(monkeypatch):
     _run(student.sui_weeks(StubCallbackQuery(cb_weeks, user, m), ident))
     markup = m.markups[-1]
     btn_texts = [b.text for row in markup.inline_keyboard for b in row]
-    assert any("W03" in t or "Week 3" in t for t in btn_texts)
+    assert any("Неделя 3" in t or "Week 3" in t for t in btn_texts)
 
 
-def test_student_week_menu_and_actions_stubs(monkeypatch):
+def test_student_week_menu_and_grades(monkeypatch):
     from app.core import callbacks
+    from app.db.conn import db
 
     _install_aiogram_stub(monkeypatch)
     _apply_weeks_migration()
@@ -209,16 +210,88 @@ def test_student_week_menu_and_actions_stubs(monkeypatch):
     # Open week menu
     cb_week = callbacks.build("s", {"action": "week_menu", "week": 3}, role="student")
     _run(student.sui_week_menu(StubCallbackQuery(cb_week, user, m), ident))
-    assert any("W03" in t for t, _, _ in m.answers)
+    assert any("Неделя 3" in t for t, _, _ in m.answers)
 
-    # Trigger a stub action
-    cb_info = callbacks.build("s", {"action": "week_info", "week": 3}, role="student")
-    cq = StubCallbackQuery(cb_info, user, m)
-    _run(student.sui_week_action_stub(cq, ident))
-    assert any("Функция в разработке" in t for t, _, _ in m.answers)
+    # Check grade screen when no grade is set
+    cb_grade = callbacks.build("s", {"action": "week_grade", "week": 3}, role="student")
+    cq_grade = StubCallbackQuery(cb_grade, user, m)
+    _run(student.sui_week_grade(cq_grade, ident))
+    text_no_grade = m.answers[-1][0]
+    assert "Оценка ещё не выставлена" in text_no_grade
+
+    # Add grade for week 3 and reopen
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM submissions WHERE student_id=? AND week_no=?",
+            (ident.id, 3),
+        )
+        conn.execute(
+            "INSERT INTO submissions(week_no, student_id, status, grade, created_at_utc) "
+            "VALUES(?, ?, 'graded', '8', strftime('%s','now'))",
+            (3, ident.id),
+        )
+        conn.commit()
+
+    cb_grade2 = callbacks.build(
+        "s", {"action": "week_grade", "week": 3}, role="student"
+    )
+    cq_grade2 = StubCallbackQuery(cb_grade2, user, m)
+    _run(student.sui_week_grade(cq_grade2, ident))
+    text_with_grade = m.answers[-1][0]
+    assert "Ваша оценка" in text_with_grade and "8" in text_with_grade
     # nav keyboard present
     markup = m.markups[-1]
     last_row = markup.inline_keyboard[-1]
+    assert any("Главное меню" in b.text for b in last_row)
+    assert any("Назад" in b.text for b in last_row)
+
+
+def test_student_my_grades_overview(monkeypatch):
+    from app.core import callbacks
+    from app.core.repos_epic4 import list_weeks_with_titles
+    from app.db.conn import db
+
+    _install_aiogram_stub(monkeypatch)
+    _apply_weeks_migration()
+    _seed_student_and_week()
+
+    from app.bot import ui_student_stub as student
+
+    importlib.reload(student)
+
+    user = StubUser(1001, full_name="Student")
+    m = StubMessage(user)
+    ident = _identity("s-1", role="student")
+
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM submissions WHERE student_id=?",
+            (ident.id,),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO weeks(week_no, title, created_at_utc) VALUES(4,'Week 4', strftime('%s','now'))"
+        )
+        conn.execute(
+            "INSERT INTO submissions(week_no, student_id, status, grade, created_at_utc) "
+            "VALUES(?, ?, 'graded', '8', strftime('%s','now'))",
+            (3, ident.id),
+        )
+        conn.commit()
+
+    cb = callbacks.build("s", {"action": "my_grades"}, role="student")
+    _run(student.sui_my_grades(StubCallbackQuery(cb, user, m), ident))
+    text = m.answers[-1][0]
+    lines = text.splitlines()
+    weeks = list_weeks_with_titles(limit=200)
+    total_weeks = len(weeks)
+    expected_avg = 8 / total_weeks if total_weeks else 0
+    expected_avg_str = f"{expected_avg:.1f}".rstrip("0").rstrip(".")
+    avg_line = next(line for line in lines if line.startswith("📈"))
+    assert expected_avg_str in avg_line
+    assert any("🎯" in line and "Неделя 3" in line and "8" in line for line in lines)
+    assert any(line.startswith("🕑") for line in lines)
+    # nav keyboard present
+    last_row = m.markups[-1].inline_keyboard[-1]
     assert any("Главное меню" in b.text for b in last_row)
     assert any("Назад" in b.text for b in last_row)
 

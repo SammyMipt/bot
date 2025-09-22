@@ -126,13 +126,13 @@ def parse_deadline(dt_str: str, course_tz: Optional[str] = None) -> int:
 
 
 def format_dual_tz(utc_ts: int, course_tz: str, user_tz: str) -> str:
-    """Return 'YYYY-MM-DD HH:MM (course_tz) (у вас сейчас: HH:MM)'."""
+    """Return 'YYYY-MM-DD HH:MM (course_tz) (у вас HH:MM)'."""
     ct = _zone(course_tz)
     ut = _zone(user_tz)
     base = datetime.fromtimestamp(int(utc_ts), tz=timezone.utc)
     cdt = base.astimezone(ct)
     udt = base.astimezone(ut)
-    return f"{cdt.strftime('%Y-%m-%d %H:%M')} ({course_tz}) (у вас сейчас: {udt.strftime('%H:%M')})"
+    return f"{cdt.strftime('%Y-%m-%d %H:%M')} ({course_tz}) (у вас {udt.strftime('%H:%M')})"
 
 
 @dataclass

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import re
+from typing import Optional
 
 from aiogram import F, Router, types
 from aiogram.filters import Command
@@ -19,7 +21,9 @@ from app.core.bookings_repo import (
 from app.core.files import ensure_parent_dir, link_or_copy, safe_filename, save_blob
 from app.core.repos_epic4 import (
     add_student_submission_file,
+    get_student_week_grade,
     list_materials_by_week,
+    list_student_grades,
     list_submission_files,
     list_weeks_with_titles,
     soft_delete_student_submission_file,
@@ -33,6 +37,56 @@ try:
     from aiogram.types import BufferedInputFile
 except Exception:  # pragma: no cover
     BufferedInputFile = None  # type: ignore
+
+
+_WEEK_TITLE_PREFIX_RE = re.compile(r"^W0*\d+\s*(?:[-—:–]\s*)?", re.IGNORECASE)
+
+
+def _clean_week_title(value: str | None) -> str:
+    """Remove technical week prefixes like `W01 —` from human titles."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        cleaned = _WEEK_TITLE_PREFIX_RE.sub("", text)
+        return cleaned.strip()
+    except re.error:
+        return text
+
+
+def _parse_grade_value(raw: Optional[str]) -> tuple[Optional[str], Optional[int]]:
+    if raw is None:
+        return None, None
+    text = str(raw).strip()
+    if not text:
+        return None, None
+    if text.isdigit():
+        try:
+            return text, int(text)
+        except ValueError:
+            return text, None
+    return text, None
+
+
+def _grade_emoji(score: Optional[int]) -> str:
+    if score is None:
+        return ""
+    if score >= 9:
+        return "🌟"
+    if score >= 7:
+        return "💪"
+    if score >= 5:
+        return "🙂"
+    if score >= 3:
+        return "⚠️"
+    return "🚨"
+
+
+def _format_average(value: float) -> str:
+    formatted = f"{value:.1f}"
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return formatted
 
 
 def _uid(x: types.Message | types.CallbackQuery) -> int:
@@ -168,8 +222,12 @@ def _weeks_kb(page: int = 0, per_page: int = 8) -> types.InlineKeyboardMarkup:
     rows: list[list[types.InlineKeyboardButton]] = []
     for wno, title in chunk:
         label = f"📘 Неделя {int(wno)}"
-        if title:
-            label += f". {title}"
+        cleaned_title = _clean_week_title(title)
+        display_title = cleaned_title or (
+            title.strip() if isinstance(title, str) else ""
+        )
+        if display_title:
+            label += f" — {display_title}"
         rows.append(
             [
                 types.InlineKeyboardButton(
@@ -208,19 +266,6 @@ def _week_menu_kb(week: int) -> types.InlineKeyboardMarkup:
             types.InlineKeyboardButton(
                 text="📄 Материалы недели",
                 callback_data=cb("materials_week", {"week": week}),
-            )
-        ],
-        [
-            types.InlineKeyboardButton(
-                text="📚 Конспект", callback_data=cb("week_notes", {"week": week})
-            ),
-            types.InlineKeyboardButton(
-                text="📊 Презентации", callback_data=cb("week_slides", {"week": week})
-            ),
-        ],
-        [
-            types.InlineKeyboardButton(
-                text="🎥 Запись лекции", callback_data=cb("week_video", {"week": week})
             )
         ],
         [
@@ -362,10 +407,13 @@ async def sui_week_menu(
     if week_no is None:
         _, payload = callbacks.extract(cq.data, expected_role="student")
         week_no = int(payload.get("week", 0))
-    title = dict(list_weeks_with_titles(limit=200)).get(
-        int(week_no), f"W{int(week_no):02d}"
-    )
-    text = f"W{int(week_no):02d} — {title}"
+    title_map = dict(list_weeks_with_titles(limit=200))
+    raw_title = title_map.get(int(week_no), "")
+    cleaned_title = _clean_week_title(raw_title)
+    display_title = cleaned_title or raw_title
+    text = f"📘 Неделя {int(week_no)}"
+    if display_title:
+        text += f" — {display_title}"
     kb = _week_menu_kb(int(week_no))
     try:
         await cq.message.edit_text(text, reply_markup=kb)
@@ -500,10 +548,13 @@ async def sui_week_upload(cq: types.CallbackQuery, actor: Identity):
         files = []
     total_sz = sum(int(f.get("size_bytes") or 0) for f in files)
     title_map = dict(list_weeks_with_titles(limit=200))
-    title = title_map.get(int(week_no), "")
+    raw_title = title_map.get(int(week_no), "")
+    cleaned_title = _clean_week_title(raw_title)
+    display_title = cleaned_title or raw_title
+    safe_title = html.escape(display_title)
     header = (
-        f"📤 <b>Загрузка решений — W{int(week_no):02d}"
-        + (f". {html.escape(title)}" if title else "")
+        f"📤 <b>Загрузка решений — Неделя {int(week_no)}"
+        + (f" — {safe_title}" if safe_title else "")
         + "</b>"
     )
     lines = [
@@ -602,10 +653,13 @@ async def sui_receive_submission_doc(m: types.Message, actor: Identity):
     except Exception:
         pass
     title_map = dict(list_weeks_with_titles(limit=200))
-    title = title_map.get(int(week), "")
+    raw_title = title_map.get(int(week), "")
+    cleaned_title = _clean_week_title(raw_title)
+    display_title = cleaned_title or raw_title
+    safe_title = html.escape(display_title)
     msg = (
-        f"📤 <b>Файл загружен — W{int(week):02d}"
-        + (f". {html.escape(title)}" if title else "")
+        f"📤 <b>Файл загружен — Неделя {int(week)}"
+        + (f" — {safe_title}" if safe_title else "")
         + "</b>"
     )
     await m.answer(
@@ -688,10 +742,13 @@ if hasattr(F, "photo"):
         except Exception:
             pass
         title_map = dict(list_weeks_with_titles(limit=200))
-        title = title_map.get(int(week), "")
+        raw_title = title_map.get(int(week), "")
+        cleaned_title = _clean_week_title(raw_title)
+        display_title = cleaned_title or raw_title
+        safe_title = html.escape(display_title)
         msg = (
-            f"📤 <b>Файл загружен — W{int(week):02d}"
-            + (f". {html.escape(title)}" if title else "")
+            f"📤 <b>Файл загружен — Неделя {int(week)}"
+            + (f" — {safe_title}" if safe_title else "")
             + "</b>"
         )
         await m.answer(
@@ -737,10 +794,13 @@ async def sui_delete_submission_file(cq: types.CallbackQuery, actor: Identity):
         files = []
     total_sz = sum(int(f.get("size_bytes") or 0) for f in files)
     title_map = dict(list_weeks_with_titles(limit=200))
-    title = title_map.get(int(week), "")
+    raw_title = title_map.get(int(week), "")
+    cleaned_title = _clean_week_title(raw_title)
+    display_title = cleaned_title or raw_title
+    safe_title = html.escape(display_title)
     header = (
-        f"📤 <b>Загрузка решений — W{int(week):02d}"
-        + (f". {html.escape(title)}" if title else "")
+        f"📤 <b>Загрузка решений — Неделя {int(week)}"
+        + (f" — {safe_title}" if safe_title else "")
         + "</b>"
     )
     lines = [
@@ -796,13 +856,13 @@ async def sui_week_info(cq: types.CallbackQuery, actor: Identity):
     deadline_ts = int(row[2]) if row and row[2] is not None else None
 
     # Build HTML card
-    safe_topic = html.escape(topic)
+    cleaned_topic = _clean_week_title(topic)
+    display_topic = cleaned_topic or topic
+    safe_topic = html.escape(display_topic)
     safe_desc = html.escape(description)
-    header = (
-        f"📘 <b>W{int(week_no):02d}</b> — {safe_topic}"
-        if safe_topic
-        else f"📘 <b>W{int(week_no):02d}</b>"
-    )
+    header = f"📘 <b>Неделя {int(week_no)}</b>"
+    if safe_topic:
+        header += f" — {safe_topic}"
 
     if deadline_ts:
         course_tz = get_course_tz()
@@ -865,6 +925,57 @@ async def sui_week_info(cq: types.CallbackQuery, actor: Identity):
 # ------- Materials for week (student) -------
 
 
+@router.callback_query(_is({"week_grade"}))
+async def sui_week_grade(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "student":
+        return await cq.answer("⛔ Доступ запрещён", show_alert=True)
+    try:
+        _, payload = callbacks.extract(cq.data, expected_role="student")
+    except Exception:
+        await _toast_error(cq, "E_STATE_EXPIRED")
+        return
+    week_no = int((payload or {}).get("week", 0))
+    if not week_no:
+        return await _toast_error(cq, "E_INPUT_INVALID")
+
+    title_map = dict(list_weeks_with_titles(limit=200))
+    raw_title = title_map.get(int(week_no), "")
+    cleaned_title = _clean_week_title(raw_title)
+    display_title = cleaned_title or raw_title
+
+    raw_grade = get_student_week_grade(actor.id, week_no)
+    grade_text, grade_value = _parse_grade_value(raw_grade)
+
+    header = f"📊 <b>Оценка — Неделя {int(week_no)}"
+    if display_title:
+        header += f" — {display_title}"
+    header += "</b>"
+    lines = [header, ""]
+    if grade_text is None:
+        lines.append("🕑 Оценка ещё не выставлена. Загляните позже.")
+    else:
+        mood = _grade_emoji(grade_value)
+        line = f"🎯 Ваша оценка: <b>{grade_text}</b>"
+        if grade_value is not None:
+            line += "/10"
+        if mood:
+            line += f" {mood}"
+        lines.append(line)
+        if grade_value is None:
+            lines.append("<i>Оценка задана в нестандартном формате.</i>")
+    lines.append("")
+    lines.append("👉 Выберите действие ниже:")
+
+    text = "\n".join(lines)
+    kb = _nav_keyboard()
+    try:
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+    _stack_push(_uid(cq), "week_grade", {"week": int(week_no)})
+
+
 def _week_id_by_no(week_no: int) -> int | None:
     with db() as conn:
         row = conn.execute(
@@ -883,7 +994,11 @@ async def _send_material(cq: types.CallbackQuery, *, week_no: int, mtype: str) -
         return await _toast_error(cq, "E_NOT_FOUND", "Материал не найден")
     # Build labels like teacher UI
     title_map = dict(list_weeks_with_titles(limit=200))
-    title = title_map.get(int(week_no), "")
+    raw_title = title_map.get(int(week_no), "")
+    cleaned_title = _clean_week_title(raw_title)
+    display_title = cleaned_title or (
+        raw_title.strip() if isinstance(raw_title, str) else ""
+    )
     labels = {
         "p": ("📄", "Материалы недели"),
         "n": ("📚", "Конспект"),
@@ -897,8 +1012,8 @@ async def _send_material(cq: types.CallbackQuery, *, week_no: int, mtype: str) -
         url = str(mat.path)
         try:
             msg = f"{emoji} <b>Неделя {int(week_no)}"
-            if title:
-                msg += f". {title}"
+            if display_title:
+                msg += f" — {display_title}"
             msg += f'.</b> <a href="{url}">{name}</a>'
             await cq.message.answer(
                 msg, parse_mode="HTML", disable_web_page_preview=True
@@ -916,8 +1031,8 @@ async def _send_material(cq: types.CallbackQuery, *, week_no: int, mtype: str) -
             data = f.read()
         if BufferedInputFile is not None:
             caption = f"{emoji} <b>Неделя {int(week_no)}"
-            if title:
-                caption += f". {title}"
+            if display_title:
+                caption += f" — {display_title}"
             caption += f".</b> {name}."
             await cq.message.answer_document(
                 BufferedInputFile(data, filename=fname),
@@ -974,9 +1089,12 @@ async def sui_materials_week(cq: types.CallbackQuery, actor: Identity):
         last = _stack_pop(_uid(cq)) or {}
         p = dict(last.get("p") or {})
         week_no = int(p.get("week", 0))
-    title = dict(list_weeks_with_titles(limit=200)).get(int(week_no), "")
-    if title:
-        text = f"📚 <b>Неделя {int(week_no)}. {title}</b>\nВыберите материал:"
+    title_map = dict(list_weeks_with_titles(limit=200))
+    raw_title = title_map.get(int(week_no), "")
+    cleaned_title = _clean_week_title(raw_title)
+    display_title = cleaned_title or raw_title
+    if display_title:
+        text = f"📚 <b>Неделя {int(week_no)} — {display_title}</b>\nВыберите материал:"
     else:
         text = f"📚 <b>Неделя {int(week_no)}</b>\nВыберите материал:"
     kb = _materials_types_kb_s(int(week_no))
@@ -1368,23 +1486,36 @@ async def sui_list_my_bookings(cq: types.CallbackQuery, actor: Identity):
 async def sui_list_history(cq: types.CallbackQuery, actor: Identity):
     rows = list_history(actor.id)
     if not rows:
-        text = "📜 История\n\n⚠️ У вас пока нет прошедших/отменённых записей"
+        text = "📜 История\n\n⚠️ У вас пока нет прошедших или отменённых записей"
         kb = _nav_keyboard()
         try:
             await cq.message.edit_text(text, reply_markup=kb)
         except Exception:
             await cq.message.answer(text, reply_markup=kb)
         return await cq.answer()
+
+    grades_map = list_student_grades(actor.id)
+    now_ts = utc_now_ts()
     lines = ["📜 История"]
-    status_map = {
-        "canceled": "отменена",
-        "attended": "посещено",
-        "no_show": "не явился",
-    }
-    for w, sid, st, starts in rows[:50]:
-        lines.append(f"W{int(w):02d} · {_fmt_dt(starts)} · {status_map.get(st, st)}")
+    for week_no, _slot_id, status, starts_at, teacher_name in rows:
+        if status != "canceled" and starts_at and starts_at > now_ts:
+            continue
+        label = f"Неделя {int(week_no)}"
+        dt_line = _fmt_dt(starts_at) if starts_at else "—"
+        teacher = teacher_name.strip() or "Преподаватель"
+        status_text = "отменена" if status == "canceled" else "завершилась"
+        grade_raw = grades_map.get(int(week_no))
+        grade = grade_raw.strip() if isinstance(grade_raw, str) else grade_raw
+        line = f"{label} — {dt_line}, {teacher}, {status_text}"
+        if status_text == "завершилась" and grade:
+            line += f" (оценка: {grade})"
+        lines.append(line)
+
+    if len(lines) == 1:
+        lines.append("⚠️ У вас пока нет прошедших или отменённых записей")
+
     kb = _nav_keyboard()
-    text = "\n".join(lines)
+    text = "\n".join(lines[:51])
     try:
         await cq.message.edit_text(text, reply_markup=kb)
     except Exception:
@@ -1392,27 +1523,76 @@ async def sui_list_history(cq: types.CallbackQuery, actor: Identity):
     await cq.answer()
 
 
-# ------- Stubs for remaining actions -------
+# ------- Grades overview -------
 
 
-def _dev_stub_text() -> str:
-    return "Функция в разработке"
-
-
-@router.callback_query(_is({"week_upload", "week_grade"}))
-async def sui_other_week_action_stub(cq: types.CallbackQuery, actor: Identity):
+@router.callback_query(_is({"my_grades"}))
+async def sui_my_grades(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "student":
         return await cq.answer("⛔ Доступ запрещён", show_alert=True)
     try:
         callbacks.extract(cq.data, expected_role="student")
     except Exception:
         await _toast_error(cq, "E_STATE_EXPIRED")
-    # Only week_grade stays stub here
+    weeks = list_weeks_with_titles(limit=200)
+    grades_map = list_student_grades(actor.id)
+
+    lines: list[str] = ["📊 <b>Мои оценки</b>"]
+    if not weeks:
+        lines.append("")
+        lines.append("⚠️ В системе пока нет недель курса.")
+    else:
+        total_weeks = len(weeks)
+        total_score = 0
+        grade_lines: list[str] = []
+        for week_no, title in weeks:
+            label = f"Неделя {int(week_no)}"
+            display_title = _clean_week_title(title)
+            if not display_title and isinstance(title, str):
+                display_title = title.strip()
+            if display_title:
+                label += f" — {display_title}"
+            raw_grade = grades_map.get(int(week_no))
+            grade_text, grade_value = _parse_grade_value(raw_grade)
+            if grade_text is None:
+                grade_lines.append(f"🕑 {label}: <b>—</b> <i>(ещё нет оценки)</i>")
+                value_for_avg = 0
+            elif grade_value is None:
+                grade_lines.append(
+                    f"📝 {label}: <b>{grade_text}</b> <i>(нестандартный формат)</i>"
+                )
+                value_for_avg = 0
+            else:
+                mood = _grade_emoji(grade_value)
+                line = f"🎯 {label}: <b>{grade_value}</b>/10"
+                if mood:
+                    line += f" {mood}"
+                grade_lines.append(line)
+                value_for_avg = grade_value
+            total_score += value_for_avg
+        average = total_score / total_weeks if total_weeks else 0.0
+        avg_str = _format_average(average)
+        lines.append(f"📈 <b>Средний балл:</b> {avg_str} из 10")
+        lines.append("")
+        lines.extend(grade_lines)
+        lines.append("")
+        lines.append("ℹ️ Недели без оценки учитываются как 0 при расчёте среднего.")
+
+    text = "\n".join(lines)
+    kb = _nav_keyboard()
     try:
-        await cq.message.edit_text(_dev_stub_text(), reply_markup=_nav_keyboard())
+        await cq.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
-        await cq.message.answer(_dev_stub_text(), reply_markup=_nav_keyboard())
-    await cq.answer("Страница-заглушка")
+        await cq.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await cq.answer()
+    _stack_push(_uid(cq), "my_grades", {})
+
+
+# ------- Stubs for remaining actions -------
+
+
+def _dev_stub_text() -> str:
+    return "Функция в разработке"
 
 
 # Backward-compat: keep original stub function name for tests
@@ -1433,7 +1613,7 @@ async def sui_week_action_stub(cq: types.CallbackQuery, actor: Identity):
 # ------- Stubs for main menu entries -------
 
 
-@router.callback_query(_is({"my_bookings", "my_grades", "history"}))
+@router.callback_query(_is({"my_bookings", "history"}))
 async def sui_top_level_stub(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "student":
         return await cq.answer("⛔ Доступ запрещён", show_alert=True)
@@ -1447,11 +1627,3 @@ async def sui_top_level_stub(cq: types.CallbackQuery, actor: Identity):
         return await sui_list_my_bookings(cq, actor)
     if action == "history":
         return await sui_list_history(cq, actor)
-    # grades still stub
-    text = "📊 Мои оценки\nФункция в разработке"
-    kb = _nav_keyboard()
-    try:
-        await cq.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await cq.message.answer(text, reply_markup=kb)
-    await cq.answer()
