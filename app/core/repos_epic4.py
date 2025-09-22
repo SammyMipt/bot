@@ -833,6 +833,55 @@ def list_week_submission_files_for_teacher(student_id: str, week_no: int) -> Lis
 # ---------- GRADES (history + current in submissions) ----------
 
 
+def get_student_week_grade(student_id: str, week_no: int) -> Optional[str]:
+    """Возвращает актуальную оценку студента за указанную неделю."""
+    with db() as conn:
+        row = conn.execute(
+            (
+                "SELECT grade "
+                "FROM submissions "
+                "WHERE student_id=? AND week_no=? "
+                "  AND grade IS NOT NULL AND TRIM(grade) <> '' "
+                "ORDER BY COALESCE(reviewed_at_utc, created_at_utc, 0) DESC, id DESC "
+                "LIMIT 1"
+            ),
+            (student_id, week_no),
+        ).fetchone()
+    if not row:
+        return None
+    grade = str(row[0] or "").strip()
+    return grade or None
+
+
+def list_student_grades(student_id: str) -> Dict[int, str]:
+    """Словарь {week_no: grade_str} с актуальными оценками студента."""
+    with db() as conn:
+        rows = conn.execute(
+            (
+                "SELECT week_no, grade "
+                "FROM submissions "
+                "WHERE student_id=? "
+                "  AND week_no IS NOT NULL "
+                "  AND grade IS NOT NULL AND TRIM(grade) <> '' "
+                "ORDER BY week_no ASC, COALESCE(reviewed_at_utc, created_at_utc, 0) DESC, id DESC"
+            ),
+            (student_id,),
+        ).fetchall()
+    result: Dict[int, str] = {}
+    for week_no, grade in rows:
+        try:
+            w = int(week_no)
+        except (TypeError, ValueError):
+            continue
+        if w in result:
+            continue  # уже пишем самую свежую запись, остальное игнорируем
+        grade_text = str(grade or "").strip()
+        if not grade_text:
+            continue
+        result[w] = grade_text
+    return result
+
+
 def set_week_grade(
     student_id: str,
     week_no: int,
