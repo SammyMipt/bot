@@ -85,38 +85,74 @@ def _eff_tg_id(raw_id: int) -> str:
     return str(raw_id)
 
 
+def _course_initialized() -> bool:
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT 1 FROM course WHERE id=1").fetchone()
+            return bool(row)
+    except Exception:
+        return False
+
+
+def _help_text() -> str:
+    return (
+        "👋 Это бот курса физики для будущих ML‑специалистов.\n"
+        "Доступные команды:\n"
+        "• /start — краткая справка\n"
+        "• /help — список команд\n"
+        "• /whoami — показать ваш профиль\n"
+        "• /register — начать регистрацию"
+    )
+
+
 @router.message(CommandStart())
 async def start(m: types.Message, actor: Identity):
     log.info(
         "/start entered: tg=%s role=%s", m.from_user.id, getattr(actor, "role", None)
     )
-    # Maintenance gate: tie to course initialization, not users table.
-    # Consider initialized when there's a row in course (id=1). No placeholders are created by migrations now.
-    try:
-        with db() as conn:
-            course_row = conn.execute("SELECT 1 FROM course WHERE id=1").fetchone()
-    except Exception:
-        course_row = None
     tg_eff = _eff_tg_id(m.from_user.id)
-    if not course_row:
-        # Allow only configured owner to proceed (owner handler will pick it up). Block everyone else.
+    initialized = _course_initialized()
+    if not initialized:
         if tg_eff in cfg.telegram_owner_ids:
-            log.info(
-                "/start: course not initialized; owner tg=%s allowed to proceed", tg_eff
+            log.info("/start: not initialized, owner will see owner-start prompt")
+            await m.answer(
+                "🧱 Курс ещё не инициализирован. Доступна инициализация владельцем"
             )
             return
-        log.info("/start: course not initialized; block tg=%s", tg_eff)
         await m.answer("🧱 Курс не инициализован. Ведутся технические работы")
         return
-    # If already registered (tg_id bound), greet and show role quick menu
+
     existing = get_user_by_tg(tg_eff)
     if existing:
         role = existing.role
+        await m.answer(f"Вы уже зарегистрированы как: {role}.\n\n" + _help_text())
+    else:
         await m.answer(
-            f"Вы уже зарегистрированы как: {role}. Доступные команды зависят от роли."
+            _help_text() + "\n\nЧтобы зарегистрироваться, используйте /register."
+        )
+
+
+@router.message(Command("start"))
+async def start_cmd(m: types.Message, actor: Identity):
+    await start(m, actor)
+
+
+async def _begin_registration(m: types.Message, actor: Identity):
+    tg_eff = _eff_tg_id(m.from_user.id)
+    initialized = _course_initialized()
+    if not initialized:
+        if tg_eff in cfg.telegram_owner_ids:
+            await m.answer(
+                "🧱 Курс ещё не инициализирован. Начните с /start как владелец."
+            )
+            return
+        await m.answer("🧱 Курс не инициализован. Ведутся технические работы")
+        return
+    if get_user_by_tg(tg_eff):
+        await m.answer(
+            "Вы уже зарегистрированы. Используйте /whoami для просмотра профиля."
         )
         return
-
     await m.answer(
         "👋 Добро пожаловать в курс физики для будущих ML‑специалистов!\n"
         "Этот бот поможет вам с учёбой: вы сможете получать материалы, сдавать работы и записываться на сдачи.\n"
@@ -126,14 +162,9 @@ async def start(m: types.Message, actor: Identity):
     )
 
 
-@router.message(Command("start"))
-async def start_cmd(m: types.Message, actor: Identity):
-    await start(m, actor)
-
-
 @router.message(Command("register"))
 async def register_cmd(m: types.Message, actor: Identity):
-    await start(m, actor)
+    await _begin_registration(m, actor)
 
 
 # Fallbacks for clients sending plain text
@@ -160,7 +191,16 @@ def _is_register_text(m: types.Message) -> bool:
 
 @router.message(F.text, _is_register_text)
 async def register_text_fallback(m: types.Message, actor: Identity):
-    await start(m, actor)
+    await _begin_registration(m, actor)
+
+
+@router.message(Command("help"))
+async def help_cmd(m: types.Message, actor: Identity):
+    initialized = _course_initialized()
+    text = _help_text()
+    if not initialized:
+        text = "🧱 Курс не инициализован. Ведутся технические работы\n\n" + text
+    await m.answer(text)
 
 
 @router.callback_query(_op("reg_menu"))

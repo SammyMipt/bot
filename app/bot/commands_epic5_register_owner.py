@@ -49,20 +49,26 @@ def _own_key(uid: int) -> str:
     return f"own:{uid}"
 
 
-@router.message(CommandStart())
+def _is_owner_message(m: types.Message) -> bool:
+    try:
+        return str(m.from_user.id) in cfg.telegram_owner_ids
+    except Exception:
+        return False
+
+
+@router.message(CommandStart(), _is_owner_message)
 async def owner_start(m: types.Message, actor: Identity):
     tg = _eff_tg_id(m.from_user.id)
-    # If already registered — let the general flow handle it
+    # Only react for predefined owner ids (guarded by filter)
+    # Owner: always show entry to (re)start/continue owner setup
     if get_user_by_tg(tg):
-        return
-    # Only react for predefined owner ids
-    if tg not in cfg.telegram_owner_ids:
-        return  # let general /start handle non-owners
-    # Owner: show owner registration entry only (без дублирования общего меню)
-    await m.answer(
-        "👋 Добро пожаловать!\nВаш Telegram ID подтверждён как владелец курса.",
-        reply_markup=_start_kb(actor.role),
-    )
+        text = (
+            "👋 Вы уже зарегистрированы как владелец.\n"
+            "Можно продолжить настройку профиля владельца."
+        )
+    else:
+        text = "👋 Добро пожаловать!\nВаш Telegram ID подтверждён как владелец курса."
+    await m.answer(text, reply_markup=_start_kb(actor.role))
 
 
 @router.message(Command("owner_start"))
@@ -87,30 +93,36 @@ async def owner_reg_start(cq: types.CallbackQuery, actor: Identity):
     if tg not in cfg.telegram_owner_ids:
         await cq.answer("⛔ Доступ запрещён", show_alert=True)
         return
-    if get_user_by_tg(tg):
-        await cq.answer("Уже зарегистрированы", show_alert=True)
-        return
-    user = create_user(tg_id=tg, role="owner", name=cq.from_user.full_name or None)
-    if user:
-        await cq.message.answer(
-            "👨‍🏫 Хотите также работать как преподаватель?",
-            reply_markup=types.InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        types.InlineKeyboardButton(
-                            text="Да",
-                            callback_data=callbacks.build("ownyes", {}, role=None),
-                        ),
-                        types.InlineKeyboardButton(
-                            text="Нет",
-                            callback_data=callbacks.build("ownno", {}, role=None),
-                        ),
-                    ]
-                ]
-            ),
-        )
-    else:
+    # Ensure owner user exists; if already exists, continue setup
+    user = get_user_by_tg(tg)
+    if not user:
+        try:
+            user = create_user(
+                tg_id=tg, role="owner", name=cq.from_user.full_name or None
+            )
+        except Exception:
+            user = None
+    if not user:
         await cq.message.answer("⛔ Ошибка регистрации владельца")
+        await cq.answer()
+        return
+    await cq.message.answer(
+        "👨‍🏫 Хотите также работать как преподаватель?",
+        reply_markup=types.InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    types.InlineKeyboardButton(
+                        text="Да",
+                        callback_data=callbacks.build("ownyes", {}, role=None),
+                    ),
+                    types.InlineKeyboardButton(
+                        text="Нет",
+                        callback_data=callbacks.build("ownno", {}, role=None),
+                    ),
+                ]
+            ]
+        ),
+    )
     await cq.answer()
 
 
