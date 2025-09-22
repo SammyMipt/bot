@@ -6,14 +6,21 @@ import time
 def _apply_base_migrations():
     import app.db.conn as conn
 
-    with open("migrations/009_slots_location.sql", "r", encoding="utf-8") as f:
-        sql = f.read()
-    with conn.db() as c:
-        try:
-            c.executescript(sql)
-            c.commit()
-        except Exception:
-            pass
+    migs = [
+        "migrations/004_course_weeks_schema.sql",
+        "migrations/009_slots_location.sql",
+        "migrations/010_course_tz.sql",
+        "migrations/011_users_tz.sql",
+    ]
+    for path in migs:
+        with open(path, "r", encoding="utf-8") as f:
+            sql = f.read()
+        with conn.db() as c:
+            try:
+                c.executescript(sql)
+                c.commit()
+            except Exception:
+                pass
 
 
 def _install_aiogram_stub(monkeypatch):
@@ -167,6 +174,59 @@ def _seed_teacher():
             (now, now),
         )
         conn.commit()
+
+
+def test_manual_time_buttons_show_teacher_local(monkeypatch, db_tmpdir):
+    from app.core import callbacks
+    from app.db.conn import db
+
+    _apply_base_migrations()
+    _install_aiogram_stub(monkeypatch)
+    _seed_teacher()
+    from app.bot import ui_teacher_stub as teacher
+
+    importlib.reload(teacher)
+
+    now = int(time.time())
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO course(id, name, created_at_utc, updated_at_utc, tz) VALUES(1, ?, ?, ?, ?)",
+            ("Course", now, now, "UTC"),
+        )
+        conn.execute(
+            "UPDATE users SET tz=? WHERE tg_id=?",
+            ("Europe/Moscow", "123"),
+        )
+        conn.commit()
+
+    user = StubUser(123, full_name="Teacher")
+    ident = _identity("123", role="teacher")
+
+    teacher._manual_ctx_put(user.id, {"y": 2025, "m": 1, "d": 2})
+
+    cb_start = callbacks.build(
+        "t",
+        {"action": "sch_manual_time_start", "part": "morning", "p": 0},
+        role="teacher",
+    )
+    m_start = StubMessage(user)
+    cq_start = StubCallbackQuery(cb_start, user, m_start)
+    _run(teacher.tui_sch_manual_time_start(cq_start, ident))
+    kb_start = m_start.markups[-1]
+    first_label = kb_start.inline_keyboard[0][0].text
+    assert first_label == "08:00 (у вас 11:00)"
+
+    teacher._manual_ctx_put(user.id, {"sh": 21, "sm": 50})
+
+    cb_end = callbacks.build(
+        "t", {"action": "sch_manual_time_end", "p": 0}, role="teacher"
+    )
+    m_end = StubMessage(user)
+    cq_end = StubCallbackQuery(cb_end, user, m_end)
+    _run(teacher.tui_sch_manual_time_end(cq_end, ident))
+    kb_end = m_end.markups[-1]
+    end_label = kb_end.inline_keyboard[0][0].text
+    assert end_label == "22:00 (у вас 01:00+1)"
 
 
 def test_step2_online_auto_advance_and_validation(monkeypatch, db_tmpdir):

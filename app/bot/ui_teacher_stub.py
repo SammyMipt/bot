@@ -558,6 +558,29 @@ def _utc_ts(year: int, month: int, day: int, hour: int, minute: int) -> int:
     return local_to_utc_ts(year, month, day, hour, minute)
 
 
+def _manual_time_label(
+    y: int, m: int, d: int, hh: int, mm: int, course_tz: str, teacher_tz: str
+) -> str:
+    base = f"{hh:02d}:{mm:02d}"
+    if not teacher_tz or teacher_tz == course_tz:
+        return base
+    try:
+        from app.services.common.time_service import local_to_utc_ts, to_course_dt
+
+        ts = local_to_utc_ts(y, m, d, hh, mm, course_tz=course_tz)
+        course_dt = to_course_dt(ts, course_tz)
+        teacher_dt = to_course_dt(ts, teacher_tz)
+    except Exception:
+        return base
+    local = f"{teacher_dt.hour:02d}:{teacher_dt.minute:02d}"
+    day_shift = (teacher_dt.date() - course_dt.date()).days
+    if day_shift > 0:
+        local += f"+{day_shift}"
+    elif day_shift < 0:
+        local += f"{day_shift}"
+    return f"{base} (у вас {local})"
+
+
 def _loc_key(uid: int) -> str:
     return f"t_loc:{uid}"
 
@@ -1085,6 +1108,19 @@ async def tui_sch_manual_time_start(cq: types.CallbackQuery, actor: Identity):
     _, payload = callbacks.extract(cq.data, expected_role=actor.role)
     part = (payload.get("part") or "morning").strip()
     page = int(payload.get("p", 0))
+    ctx = _manual_ctx_get(_uid(cq))
+    y = int(ctx.get("y", 0))
+    m = int(ctx.get("m", 0))
+    d = int(ctx.get("d", 0))
+    if not all([y, m, d]):
+        from app.services.common.time_service import course_today
+
+        today = course_today().date()
+        y, m, d = today.year, today.month, today.day
+    from app.services.common.time_service import get_course_tz
+
+    course_tz = get_course_tz()
+    teacher_tz = _teacher_tz(actor)
     h1, m1, h2, m2 = _part_range(part)
     all_times = _times_between(h1, m1, h2, m2, step=10)
     per_page = 12
@@ -1094,18 +1130,21 @@ async def tui_sch_manual_time_start(cq: types.CallbackQuery, actor: Identity):
     chunk = all_times[start : start + per_page]
     text = "Шаг 4/7 — время. Выберите время начала:"
     rows: list[list[types.InlineKeyboardButton]] = []
-    for i in range(0, len(chunk), 4):
-        row = [
-            types.InlineKeyboardButton(
-                text=f"{hh:02d}:{mm:02d}",
-                callback_data=cb(
-                    "sch_manual_time_start_pick",
-                    {"h": hh, "m": mm, "part": part, "p": page},
-                    role=actor.role,
-                ),
+    cols = 2 if teacher_tz and teacher_tz != course_tz else 4
+    for i in range(0, len(chunk), cols):
+        row: list[types.InlineKeyboardButton] = []
+        for hh, mm in chunk[i : i + cols]:
+            label = _manual_time_label(y, m, d, hh, mm, course_tz, teacher_tz)
+            row.append(
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb(
+                        "sch_manual_time_start_pick",
+                        {"h": hh, "m": mm, "part": part, "p": page},
+                        role=actor.role,
+                    ),
+                )
             )
-            for hh, mm in chunk[i : i + 4]
-        ]
         rows.append(row)
     nav: list[types.InlineKeyboardButton] = []
     if page > 0:
@@ -1178,6 +1217,18 @@ async def tui_sch_manual_time_end(cq: types.CallbackQuery, actor: Identity):
     page = int(payload.get("p", 0))
     ctx = _manual_ctx_get(_uid(cq))
     sh, sm = int(ctx.get("sh", 9)), int(ctx.get("sm", 0))
+    y = int(ctx.get("y", 0))
+    m = int(ctx.get("m", 0))
+    d = int(ctx.get("d", 0))
+    if not all([y, m, d]):
+        from app.services.common.time_service import course_today
+
+        today = course_today().date()
+        y, m, d = today.year, today.month, today.day
+    from app.services.common.time_service import get_course_tz
+
+    course_tz = get_course_tz()
+    teacher_tz = _teacher_tz(actor)
     # End times: from start+10min to min(23:50, start+6h), align to 10-min grid
     start_min = sh * 60 + sm + 10
     if start_min % 10 != 0:
@@ -1201,18 +1252,21 @@ async def tui_sch_manual_time_end(cq: types.CallbackQuery, actor: Identity):
     chunk = all_times[begin : begin + per_page]
     text = "Шаг 4/7 — время. Выберите время окончания:"
     rows: list[list[types.InlineKeyboardButton]] = []
-    for i in range(0, len(chunk), 4):
-        row = [
-            types.InlineKeyboardButton(
-                text=f"{hh:02d}:{mm:02d}",
-                callback_data=cb(
-                    "sch_manual_time_end_pick",
-                    {"h": hh, "m": mm, "p": page},
-                    role=actor.role,
-                ),
+    cols = 2 if teacher_tz and teacher_tz != course_tz else 4
+    for i in range(0, len(chunk), cols):
+        row: list[types.InlineKeyboardButton] = []
+        for hh, mm in chunk[i : i + cols]:
+            label = _manual_time_label(y, m, d, hh, mm, course_tz, teacher_tz)
+            row.append(
+                types.InlineKeyboardButton(
+                    text=label,
+                    callback_data=cb(
+                        "sch_manual_time_end_pick",
+                        {"h": hh, "m": mm, "p": page},
+                        role=actor.role,
+                    ),
+                )
             )
-            for hh, mm in chunk[i : i + 4]
-        ]
         rows.append(row)
     nav: list[types.InlineKeyboardButton] = []
     if page > 0:
@@ -1988,14 +2042,14 @@ def _format_hhmm(ts_utc: int, tz: str) -> str:
 
 
 def _format_dual_line(ts_utc: int, course_tz: str, user_tz: str | None) -> str:
-    """YYYY-MM-DD HH:MM (TZ) · у вас сейчас ≈ HH:MM"""
+    """YYYY-MM-DD HH:MM (TZ) (у вас HH:MM)"""
     from app.services.common.time_service import to_course_dt
 
     cdt = to_course_dt(ts_utc, course_tz)
     base = f"{cdt.strftime('%Y-%m-%d %H:%M')} ({course_tz})"
     if user_tz and user_tz != course_tz:
         udt = to_course_dt(ts_utc, user_tz)
-        return base + f" · у вас сейчас ≈ {udt.strftime('%H:%M')}"
+        return base + f" (у вас {udt.strftime('%H:%M')})"
     return base
 
 
@@ -2069,7 +2123,7 @@ def _slot_list_for_date_text(
         )
         del _location
         emoji = _slot_status_emoji(st_status, st, dur, booked, cap)
-        # Button: date + course time + optional local "ваш HH:MM", capacity and mode
+        # Button: date + course time + optional local "(у вас HH:MM)", capacity and mode
         dtc = to_course_dt(st)
         date_part = f"{dtc.day:02d} {_month_name(dtc)}"
         time_course = _format_hhmm(st, get_course_tz())
@@ -2078,7 +2132,7 @@ def _slot_list_for_date_text(
             if teacher_tz and teacher_tz != get_course_tz()
             else None
         )
-        local_part = f" • ваш {time_local}" if time_local else ""
+        local_part = f" (у вас {time_local})" if time_local else ""
         cap_part = f" 👥{booked}/{cap}"
         mode_part = f" {_mode_emoji(mode)}" if mode else ""
         btn_text = f"{emoji} {date_part} {time_course}{local_part}{cap_part}{mode_part}"
@@ -2193,14 +2247,14 @@ async def tui_sch_manage_all(cq: types.CallbackQuery, actor: Identity):
         booked = int(row[5])
         mode = str(row[6]) if row[6] is not None else ""
         emoji = _slot_status_emoji(st_status, st, dur, booked, cap)
-        # Compact button: course time + optional local "ваш HH:MM", capacity and mode
+        # Compact button: course time + optional local "(у вас HH:MM)", capacity and mode
         time_course = _format_hhmm(st, get_course_tz())
         time_local = (
             _format_hhmm(st, teacher_tz)
             if teacher_tz and teacher_tz != get_course_tz()
             else None
         )
-        local_part = f" • ваш {time_local}" if time_local else ""
+        local_part = f" (у вас {time_local})" if time_local else ""
         cap_part = f" 👥{booked}/{cap}"
         mode_part = f" {_mode_emoji(mode)}" if mode else ""
         dtc = to_course_dt(st)
@@ -3545,7 +3599,7 @@ def _cw_slots_for_date_kb(
             if teacher_tz and teacher_tz != get_course_tz()
             else None
         )
-        local_part = f" • ваш {time_local}" if time_local else ""
+        local_part = f" (у вас {time_local})" if time_local else ""
         cap_part = f" 👥{booked}/{cap}"
         mode_emoji = "🖥" if mode == "online" else ("🏫" if mode == "offline" else "")
         emoji = _slot_status_emoji(status, st_utc, dur, booked, cap)
