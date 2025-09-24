@@ -9,3 +9,4 @@ var/*
 !var/.gitkeep
 .env
 poetry.lock
+.coverage
