@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import re
+import uuid
 
 from aiogram import F, Router, types
 from aiogram.filters import Command
@@ -9,6 +12,16 @@ from app.core import audit, callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
 from app.core.backup import backup_recent, trigger_backup
 from app.core.config import cfg
+from app.core.course_imports import (
+    AssignmentPreview,
+    GradePreview,
+    apply_assignments,
+    apply_grades,
+    assignments_template,
+    grades_template,
+    preview_assignments,
+    preview_grades,
+)
 from app.core.course_init import apply_course_init, parse_weeks_csv
 from app.core.files import save_blob
 from app.core.imports_epic5 import (
@@ -37,6 +50,9 @@ router = Router(name="ui.owner.stub")
 
 def _uid(x: types.Message | types.CallbackQuery) -> int:
     return x.from_user.id
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _imp_key(uid: int) -> str:
@@ -485,6 +501,14 @@ def _assign_key(uid: int) -> str:
     return f"own_assign:{uid}"
 
 
+def _course_imp_key(uid: int, kind: str) -> str:
+    return f"own_course_imp:{uid}:{kind}"
+
+
+def _course_imp_ck(uid: int, kind: str) -> str:
+    return f"own_course_imp_ck:{uid}:{kind}"
+
+
 def _csv_filter_excess_columns(
     content: bytes, expected_headers: list[str]
 ) -> tuple[bytes, int, bool]:
@@ -570,6 +594,49 @@ async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
 
 # Note: /start is handled by the registration router only.
 # Owner can open main menu via /owner or /owner_menu.
+
+
+@router.message(Command("set_email"))
+async def owner_set_email_cmd(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return await m.answer("⛔ Доступ запрещён.")
+    uid = _uid(m)
+    if _get_impersonation(uid):
+        return await m.answer("⛔ Команда недоступна в режиме имперсонизации")
+
+    text = (m.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Используйте формат: /set_email имя@домен")
+
+    email = parts[1].strip()
+    if not _EMAIL_RE.match(email):
+        return await m.answer("Некорректный email. Пример: name@example.com")
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT email FROM users WHERE id=? LIMIT 1",
+            (actor.id,),
+        ).fetchone()
+        if not row:
+            return await m.answer("Профиль владельца не найден")
+
+        current = (row[0] or "").strip()
+        if current == email:
+            return await m.answer(f"⚠️ Email уже установлен: {email}")
+
+        conn.execute(
+            "UPDATE users SET email=?, updated_at_utc=strftime('%s','now') WHERE id=?",
+            (email, actor.id),
+        )
+        conn.commit()
+
+    try:
+        audit.log("OWNER_SET_EMAIL", actor.id, meta={"email": email})
+    except Exception:
+        pass
+
+    await m.answer(f"✅ Email обновлён: {email}")
 
 
 def _owner_has_teacher_cap(user_id: str) -> bool:
@@ -795,10 +862,20 @@ def _course_kb(disabled: bool) -> types.InlineKeyboardMarkup:
         text=tz_label,
         callback_data=cb("course_tz"),
     )
+    assign_btn = types.InlineKeyboardButton(
+        text=f"📋 Импорт назначений{' 🔒' if disabled else ''}",
+        callback_data=cb("course_assign_import"),
+    )
+    grades_btn = types.InlineKeyboardButton(
+        text=f"📝 Загрузка оценок{' 🔒' if disabled else ''}",
+        callback_data=cb("course_grades_import"),
+    )
     rows = [
         [init_btn],
         [info_btn],
         [tz_btn],
+        [assign_btn],
+        [grades_btn],
     ]
     rows.append(_nav_keyboard("course").inline_keyboard[0])
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1006,6 +1083,468 @@ async def ownui_course_tz_set(cq: types.CallbackQuery, actor: Identity):
             reply_markup=_course_kb(disabled=bool(_get_impersonation(_uid(cq)))),
         )
     await cq.answer()
+
+
+# -------- Course imports (assignments / grades) --------
+
+
+def _course_import_summary_lines(label: str, summary: dict[str, int]) -> list[str]:
+    return [
+        label,
+        "",
+        f"▫️ Всего строк: {summary.get('total', 0)}",
+        f"▫️ Будет создано: {summary.get('new', 0)}",
+        f"▫️ Будет обновлено: {summary.get('update', 0)}",
+        f"▫️ Без изменений: {summary.get('unchanged', 0)}",
+        f"▫️ Пропущено: {summary.get('skip', 0)}",
+        f"▫️ Ошибки: {summary.get('error', 0)}",
+        "",
+        "Чтобы пересчитать предпросмотр, отправьте обновлённый файл.",
+    ]
+
+
+@router.callback_query(_is("own", {"course_assign_import"}))
+async def ownui_course_assign_import(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    banner = await _maybe_banner(uid)
+    state_store.put_at(
+        _course_imp_key(uid, "assign"),
+        "course_assign",
+        {"mode": "await_csv"},
+        ttl_sec=900,
+    )
+    lines = [
+        "📋 Импорт назначений",
+        "",
+        "1️⃣ Скачайте шаблон и заполните столбцы",
+        "   student_email, week, teacher_email",
+        "2️⃣ Отправьте CSV в этот чат",
+        "3️⃣ Проверьте предпросмотр и подтвердите применение",
+        "",
+        "Недели вне расписания будут автоматически пропущены.",
+    ]
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="⬇️ Скачать шаблон",
+                    callback_data=cb("course_assign_tpl"),
+                )
+            ],
+            _nav_keyboard("course").inline_keyboard[0],
+        ]
+    )
+    try:
+        await cq.message.edit_text(banner + "\n".join(lines), reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + "\n".join(lines), reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"course_assign_tpl"}))
+async def ownui_course_assign_tpl(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    data = assignments_template()
+    await cq.message.answer_document(
+        types.BufferedInputFile(data, filename="assignments.csv"),
+        caption="Шаблон CSV",
+    )
+    await cq.answer()
+
+
+@router.message(F.document, lambda m: _awaits_course_import(m, "assign"))
+async def ownui_course_assign_receive(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    uid = _uid(m)
+    try:
+        action, st = state_store.get(_course_imp_key(uid, "assign"))
+    except Exception:
+        return
+    if action != "course_assign":
+        return
+
+    doc = m.document
+    file = await m.bot.get_file(doc.file_id)
+    blob = await m.bot.download_file(file.file_path)
+    content = blob.read()
+
+    ck = hashlib.sha256(content).hexdigest()
+    try:
+        prev_action, prev_ck = state_store.get(_course_imp_ck(uid, "assign"))
+    except Exception:
+        prev_action, prev_ck = None, None
+    if prev_action == "ck" and prev_ck == ck:
+        await m.answer("⚠️ Тот же файл уже обработан — пропущено")
+        return
+    state_store.put_at(_course_imp_ck(uid, "assign"), "ck", ck, ttl_sec=1800)
+
+    preview = preview_assignments(content)
+    summary = preview.summary()
+    errors = [row for row in preview.rows if row.status == "error"]
+    apply_candidates = summary.get("new", 0) + summary.get("update", 0)
+    req_id = str(uuid.uuid4())
+    state_store.put_at(
+        _course_imp_key(uid, "assign"),
+        "course_assign",
+        {
+            "mode": "preview",
+            "preview": preview.to_dict(),
+            "req": req_id,
+            "filename": doc.file_name,
+        },
+        ttl_sec=900,
+    )
+    try:
+        audit.log(
+            "OWNER_ASSIGNMENTS_IMPORT_PREVIEW",
+            actor.id,
+            request_id=req_id,
+            meta={
+                "rows_total": summary.get("total", 0),
+                "rows_apply": apply_candidates,
+                "rows_errors": summary.get("error", 0),
+            },
+        )
+    except Exception:
+        pass
+
+    banner = await _maybe_banner(uid)
+    lines = _course_import_summary_lines("📋 Предпросмотр импорта назначений", summary)
+    if doc.file_name:
+        lines.insert(1, f"Файл: {doc.file_name}")
+    if errors:
+        lines.append("\nПримеры ошибок:")
+        for row in errors[:5]:
+            lines.append(f"❌ Строка {row.index}: {row.message}")
+        if len(errors) > 5:
+            lines.append("…")
+
+    kb_rows: list[list[types.InlineKeyboardButton]] = []
+    if apply_candidates:
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text="✅ Применить", callback_data=cb("course_assign_apply")
+                )
+            ]
+        )
+    kb_rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="↻ Загрузить другой файл",
+                callback_data=cb("course_assign_import"),
+            )
+        ]
+    )
+    kb_rows.append(_nav_keyboard("course").inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await m.answer(banner + "\n".join(lines), reply_markup=kb)
+
+    if errors:
+        err_csv = preview.errors_csv()
+        if err_csv:
+            await m.answer_document(
+                types.BufferedInputFile(err_csv, filename="assignments_errors.csv"),
+                caption="Ошибки импорта",
+            )
+
+
+@router.callback_query(_is("own", {"course_assign_apply"}))
+async def ownui_course_assign_apply(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    try:
+        action, st = state_store.get(_course_imp_key(uid, "assign"))
+    except Exception:
+        return await cq.answer("Сессия истекла", show_alert=True)
+    if action != "course_assign" or (st or {}).get("mode") != "preview":
+        return await cq.answer("Нет готового предпросмотра", show_alert=True)
+    preview_data = (st or {}).get("preview")
+    if not preview_data:
+        return await cq.answer("Сессия истекла", show_alert=True)
+    preview = AssignmentPreview.from_dict(preview_data)
+    result = apply_assignments(preview)
+    try:
+        audit.log(
+            "OWNER_ASSIGNMENTS_IMPORT_COMMIT",
+            actor.id,
+            meta={
+                "applied": result.applied,
+                "unchanged": result.unchanged,
+                "errors": result.errors,
+            },
+        )
+    except Exception:
+        pass
+    try:
+        state_store.delete(_course_imp_key(uid, "assign"))
+    except Exception:
+        pass
+    try:
+        state_store.delete(_course_imp_ck(uid, "assign"))
+    except Exception:
+        pass
+
+    banner = await _maybe_banner(uid)
+    lines = [
+        "✅ Импорт назначений завершён",
+        "",
+        f"▫️ Применено: {result.applied}",
+        f"▫️ Без изменений: {result.unchanged}",
+        f"▫️ Ошибки: {result.errors}",
+        f"▫️ Пропущено: {result.skipped}",
+    ]
+    await cq.message.answer(banner + "\n".join(lines))
+
+    log_csv = preview.log_csv()
+    await cq.message.answer_document(
+        types.BufferedInputFile(log_csv, filename="assignments_import_log.csv"),
+        caption="Лог импорта",
+    )
+    await cq.answer("Импорт применён")
+
+
+@router.callback_query(_is("own", {"course_grades_import"}))
+async def ownui_course_grades_import(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    banner = await _maybe_banner(uid)
+    state_store.put_at(
+        _course_imp_key(uid, "grades"),
+        "course_grades",
+        {"mode": "await_csv"},
+        ttl_sec=900,
+    )
+    lines = [
+        "📝 Загрузка оценок",
+        "",
+        "1️⃣ Скачайте шаблон и заполните столбцы",
+        "   student_email, week, grade, teacher_email",
+        "2️⃣ Убедитесь, что преподаватель совпадает с матрицей",
+        "3️⃣ Отправьте CSV и подтвердите применение",
+        "",
+        "Допустимые значения: целые числа от 1 до 10.",
+    ]
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="⬇️ Скачать шаблон",
+                    callback_data=cb("course_grades_tpl"),
+                )
+            ],
+            _nav_keyboard("course").inline_keyboard[0],
+        ]
+    )
+    try:
+        await cq.message.edit_text(banner + "\n".join(lines), reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + "\n".join(lines), reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"course_grades_tpl"}))
+async def ownui_course_grades_tpl(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    data = grades_template()
+    await cq.message.answer_document(
+        types.BufferedInputFile(data, filename="grades.csv"),
+        caption="Шаблон CSV",
+    )
+    await cq.answer()
+
+
+@router.message(F.document, lambda m: _awaits_course_import(m, "grades"))
+async def ownui_course_grades_receive(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    uid = _uid(m)
+    try:
+        action, st = state_store.get(_course_imp_key(uid, "grades"))
+    except Exception:
+        return
+    if action != "course_grades":
+        return
+
+    doc = m.document
+    file = await m.bot.get_file(doc.file_id)
+    blob = await m.bot.download_file(file.file_path)
+    content = blob.read()
+
+    ck = hashlib.sha256(content).hexdigest()
+    try:
+        prev_action, prev_ck = state_store.get(_course_imp_ck(uid, "grades"))
+    except Exception:
+        prev_action, prev_ck = None, None
+    if prev_action == "ck" and prev_ck == ck:
+        await m.answer("⚠️ Тот же файл уже обработан — пропущено")
+        return
+    state_store.put_at(_course_imp_ck(uid, "grades"), "ck", ck, ttl_sec=1800)
+
+    preview = preview_grades(content)
+    summary = preview.summary()
+    errors = [row for row in preview.rows if row.status == "error"]
+    apply_candidates = summary.get("new", 0) + summary.get("update", 0)
+    req_id = str(uuid.uuid4())
+    state_store.put_at(
+        _course_imp_key(uid, "grades"),
+        "course_grades",
+        {
+            "mode": "preview",
+            "preview": preview.to_dict(),
+            "req": req_id,
+            "filename": doc.file_name,
+        },
+        ttl_sec=900,
+    )
+    try:
+        audit.log(
+            "OWNER_GRADES_IMPORT_PREVIEW",
+            actor.id,
+            request_id=req_id,
+            meta={
+                "rows_total": summary.get("total", 0),
+                "rows_apply": apply_candidates,
+                "rows_errors": summary.get("error", 0),
+            },
+        )
+    except Exception:
+        pass
+
+    banner = await _maybe_banner(uid)
+    lines = _course_import_summary_lines("📋 Предпросмотр импорта оценок", summary)
+    if doc.file_name:
+        lines.insert(1, f"Файл: {doc.file_name}")
+    if errors:
+        lines.append("\nПримеры ошибок:")
+        for row in errors[:5]:
+            lines.append(f"❌ Строка {row.index}: {row.message}")
+        if len(errors) > 5:
+            lines.append("…")
+
+    kb_rows: list[list[types.InlineKeyboardButton]] = []
+    if apply_candidates:
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text="✅ Применить", callback_data=cb("course_grades_apply")
+                )
+            ]
+        )
+    kb_rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="↻ Загрузить другой файл",
+                callback_data=cb("course_grades_import"),
+            )
+        ]
+    )
+    kb_rows.append(_nav_keyboard("course").inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await m.answer(banner + "\n".join(lines), reply_markup=kb)
+
+    if errors:
+        err_csv = preview.errors_csv()
+        if err_csv:
+            await m.answer_document(
+                types.BufferedInputFile(err_csv, filename="grades_errors.csv"),
+                caption="Ошибки импорта",
+            )
+
+
+@router.callback_query(_is("own", {"course_grades_apply"}))
+async def ownui_course_grades_apply(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    try:
+        action, st = state_store.get(_course_imp_key(uid, "grades"))
+    except Exception:
+        return await cq.answer("Сессия истекла", show_alert=True)
+    if action != "course_grades" or (st or {}).get("mode") != "preview":
+        return await cq.answer("Нет готового предпросмотра", show_alert=True)
+    preview_data = (st or {}).get("preview")
+    if not preview_data:
+        return await cq.answer("Сессия истекла", show_alert=True)
+    preview = GradePreview.from_dict(preview_data)
+    result = apply_grades(preview)
+    try:
+        audit.log(
+            "OWNER_GRADES_IMPORT_COMMIT",
+            actor.id,
+            meta={
+                "applied": result.applied,
+                "unchanged": result.unchanged,
+                "errors": result.errors,
+            },
+        )
+    except Exception:
+        pass
+    try:
+        state_store.delete(_course_imp_key(uid, "grades"))
+    except Exception:
+        pass
+    try:
+        state_store.delete(_course_imp_ck(uid, "grades"))
+    except Exception:
+        pass
+
+    banner = await _maybe_banner(uid)
+    lines = [
+        "✅ Импорт оценок завершён",
+        "",
+        f"▫️ Применено: {result.applied}",
+        f"▫️ Без изменений: {result.unchanged}",
+        f"▫️ Ошибки: {result.errors}",
+        f"▫️ Пропущено: {result.skipped}",
+    ]
+    await cq.message.answer(banner + "\n".join(lines))
+
+    log_csv = preview.log_csv()
+    await cq.message.answer_document(
+        types.BufferedInputFile(log_csv, filename="grades_import_log.csv"),
+        caption="Лог импорта",
+    )
+    await cq.answer("Импорт применён")
 
 
 @router.callback_query(_is("own", {"course_tz_reg_page"}))
@@ -2038,6 +2577,15 @@ def _awaits_imp(m: types.Message, kind: str) -> bool:
     except Exception:
         return False
     return action == kind and (st or {}).get("mode") == "await_csv"
+
+
+def _awaits_course_import(m: types.Message, kind: str) -> bool:
+    try:
+        action, st = state_store.get(_course_imp_key(m.from_user.id, kind))
+    except Exception:
+        return False
+    mode = (st or {}).get("mode")
+    return action == f"course_{kind}" and mode in {"await_csv", "preview"}
 
 
 @router.callback_query(_is("own", {"people_imp_students"}))

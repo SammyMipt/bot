@@ -889,6 +889,7 @@ def set_week_grade(
     score_int: int,
     *,
     comment: Optional[str] = None,
+    origin: str = "slot",
 ) -> None:
     """Set/update a student's grade for a week.
 
@@ -949,7 +950,7 @@ def set_week_grade(
                     now,
                     prev_int,
                     comment,
-                    "slot",
+                    origin,
                 ),
             )
         except sqlite3.OperationalError:
