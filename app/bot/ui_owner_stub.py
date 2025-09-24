@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import re
+import uuid
 
 from aiogram import F, Router, types
 from aiogram.filters import Command
@@ -9,6 +12,16 @@ from app.core import audit, callbacks, state_store
 from app.core.auth import Identity, get_user_by_tg
 from app.core.backup import backup_recent, trigger_backup
 from app.core.config import cfg
+from app.core.course_imports import (
+    AssignmentPreview,
+    GradePreview,
+    apply_assignments,
+    apply_grades,
+    assignments_template,
+    grades_template,
+    preview_assignments,
+    preview_grades,
+)
 from app.core.course_init import apply_course_init, parse_weeks_csv
 from app.core.files import save_blob
 from app.core.imports_epic5 import (
@@ -37,6 +50,9 @@ router = Router(name="ui.owner.stub")
 
 def _uid(x: types.Message | types.CallbackQuery) -> int:
     return x.from_user.id
+
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 def _imp_key(uid: int) -> str:
@@ -485,6 +501,14 @@ def _assign_key(uid: int) -> str:
     return f"own_assign:{uid}"
 
 
+def _course_imp_key(uid: int, kind: str) -> str:
+    return f"own_course_imp:{uid}:{kind}"
+
+
+def _course_imp_ck(uid: int, kind: str) -> str:
+    return f"own_course_imp_ck:{uid}:{kind}"
+
+
 def _csv_filter_excess_columns(
     content: bytes, expected_headers: list[str]
 ) -> tuple[bytes, int, bool]:
@@ -570,6 +594,49 @@ async def owner_menu_alt_cmd(m: types.Message, actor: Identity):
 
 # Note: /start is handled by the registration router only.
 # Owner can open main menu via /owner or /owner_menu.
+
+
+@router.message(Command("set_email"))
+async def owner_set_email_cmd(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return await m.answer("⛔ Доступ запрещён.")
+    uid = _uid(m)
+    if _get_impersonation(uid):
+        return await m.answer("⛔ Команда недоступна в режиме имперсонизации")
+
+    text = (m.text or "").strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return await m.answer("Используйте формат: /set_email имя@домен")
+
+    email = parts[1].strip()
+    if not _EMAIL_RE.match(email):
+        return await m.answer("Некорректный email. Пример: name@example.com")
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT email FROM users WHERE id=? LIMIT 1",
+            (actor.id,),
+        ).fetchone()
+        if not row:
+            return await m.answer("Профиль владельца не найден")
+
+        current = (row[0] or "").strip()
+        if current == email:
+            return await m.answer(f"⚠️ Email уже установлен: {email}")
+
+        conn.execute(
+            "UPDATE users SET email=?, updated_at_utc=strftime('%s','now') WHERE id=?",
+            (email, actor.id),
+        )
+        conn.commit()
+
+    try:
+        audit.log("OWNER_SET_EMAIL", actor.id, meta={"email": email})
+    except Exception:
+        pass
+
+    await m.answer(f"✅ Email обновлён: {email}")
 
 
 def _owner_has_teacher_cap(user_id: str) -> bool:
@@ -795,10 +862,20 @@ def _course_kb(disabled: bool) -> types.InlineKeyboardMarkup:
         text=tz_label,
         callback_data=cb("course_tz"),
     )
+    assign_btn = types.InlineKeyboardButton(
+        text=f"📋 Импорт назначений{' 🔒' if disabled else ''}",
+        callback_data=cb("course_assign_import"),
+    )
+    grades_btn = types.InlineKeyboardButton(
+        text=f"📝 Загрузка оценок{' 🔒' if disabled else ''}",
+        callback_data=cb("course_grades_import"),
+    )
     rows = [
         [init_btn],
         [info_btn],
         [tz_btn],
+        [assign_btn],
+        [grades_btn],
     ]
     rows.append(_nav_keyboard("course").inline_keyboard[0])
     return types.InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1006,6 +1083,468 @@ async def ownui_course_tz_set(cq: types.CallbackQuery, actor: Identity):
             reply_markup=_course_kb(disabled=bool(_get_impersonation(_uid(cq)))),
         )
     await cq.answer()
+
+
+# -------- Course imports (assignments / grades) --------
+
+
+def _course_import_summary_lines(label: str, summary: dict[str, int]) -> list[str]:
+    return [
+        label,
+        "",
+        f"▫️ Всего строк: {summary.get('total', 0)}",
+        f"▫️ Будет создано: {summary.get('new', 0)}",
+        f"▫️ Будет обновлено: {summary.get('update', 0)}",
+        f"▫️ Без изменений: {summary.get('unchanged', 0)}",
+        f"▫️ Пропущено: {summary.get('skip', 0)}",
+        f"▫️ Ошибки: {summary.get('error', 0)}",
+        "",
+        "Чтобы пересчитать предпросмотр, отправьте обновлённый файл.",
+    ]
+
+
+@router.callback_query(_is("own", {"course_assign_import"}))
+async def ownui_course_assign_import(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    banner = await _maybe_banner(uid)
+    state_store.put_at(
+        _course_imp_key(uid, "assign"),
+        "course_assign",
+        {"mode": "await_csv"},
+        ttl_sec=900,
+    )
+    lines = [
+        "📋 Импорт назначений",
+        "",
+        "1️⃣ Скачайте шаблон и заполните столбцы",
+        "   student_email, week, teacher_email",
+        "2️⃣ Отправьте CSV в этот чат",
+        "3️⃣ Проверьте предпросмотр и подтвердите применение",
+        "",
+        "Недели вне расписания будут автоматически пропущены.",
+    ]
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="⬇️ Скачать шаблон",
+                    callback_data=cb("course_assign_tpl"),
+                )
+            ],
+            _nav_keyboard("course").inline_keyboard[0],
+        ]
+    )
+    try:
+        await cq.message.edit_text(banner + "\n".join(lines), reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + "\n".join(lines), reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"course_assign_tpl"}))
+async def ownui_course_assign_tpl(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    data = assignments_template()
+    await cq.message.answer_document(
+        types.BufferedInputFile(data, filename="assignments.csv"),
+        caption="Шаблон CSV",
+    )
+    await cq.answer()
+
+
+@router.message(F.document, lambda m: _awaits_course_import(m, "assign"))
+async def ownui_course_assign_receive(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    uid = _uid(m)
+    try:
+        action, st = state_store.get(_course_imp_key(uid, "assign"))
+    except Exception:
+        return
+    if action != "course_assign":
+        return
+
+    doc = m.document
+    file = await m.bot.get_file(doc.file_id)
+    blob = await m.bot.download_file(file.file_path)
+    content = blob.read()
+
+    ck = hashlib.sha256(content).hexdigest()
+    try:
+        prev_action, prev_ck = state_store.get(_course_imp_ck(uid, "assign"))
+    except Exception:
+        prev_action, prev_ck = None, None
+    if prev_action == "ck" and prev_ck == ck:
+        await m.answer("⚠️ Тот же файл уже обработан — пропущено")
+        return
+    state_store.put_at(_course_imp_ck(uid, "assign"), "ck", ck, ttl_sec=1800)
+
+    preview = preview_assignments(content)
+    summary = preview.summary()
+    errors = [row for row in preview.rows if row.status == "error"]
+    apply_candidates = summary.get("new", 0) + summary.get("update", 0)
+    req_id = str(uuid.uuid4())
+    state_store.put_at(
+        _course_imp_key(uid, "assign"),
+        "course_assign",
+        {
+            "mode": "preview",
+            "preview": preview.to_dict(),
+            "req": req_id,
+            "filename": doc.file_name,
+        },
+        ttl_sec=900,
+    )
+    try:
+        audit.log(
+            "OWNER_ASSIGNMENTS_IMPORT_PREVIEW",
+            actor.id,
+            request_id=req_id,
+            meta={
+                "rows_total": summary.get("total", 0),
+                "rows_apply": apply_candidates,
+                "rows_errors": summary.get("error", 0),
+            },
+        )
+    except Exception:
+        pass
+
+    banner = await _maybe_banner(uid)
+    lines = _course_import_summary_lines("📋 Предпросмотр импорта назначений", summary)
+    if doc.file_name:
+        lines.insert(1, f"Файл: {doc.file_name}")
+    if errors:
+        lines.append("\nПримеры ошибок:")
+        for row in errors[:5]:
+            lines.append(f"❌ Строка {row.index}: {row.message}")
+        if len(errors) > 5:
+            lines.append("…")
+
+    kb_rows: list[list[types.InlineKeyboardButton]] = []
+    if apply_candidates:
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text="✅ Применить", callback_data=cb("course_assign_apply")
+                )
+            ]
+        )
+    kb_rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="↻ Загрузить другой файл",
+                callback_data=cb("course_assign_import"),
+            )
+        ]
+    )
+    kb_rows.append(_nav_keyboard("course").inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await m.answer(banner + "\n".join(lines), reply_markup=kb)
+
+    if errors:
+        err_csv = preview.errors_csv()
+        if err_csv:
+            await m.answer_document(
+                types.BufferedInputFile(err_csv, filename="assignments_errors.csv"),
+                caption="Ошибки импорта",
+            )
+
+
+@router.callback_query(_is("own", {"course_assign_apply"}))
+async def ownui_course_assign_apply(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    try:
+        action, st = state_store.get(_course_imp_key(uid, "assign"))
+    except Exception:
+        return await cq.answer("Сессия истекла", show_alert=True)
+    if action != "course_assign" or (st or {}).get("mode") != "preview":
+        return await cq.answer("Нет готового предпросмотра", show_alert=True)
+    preview_data = (st or {}).get("preview")
+    if not preview_data:
+        return await cq.answer("Сессия истекла", show_alert=True)
+    preview = AssignmentPreview.from_dict(preview_data)
+    result = apply_assignments(preview)
+    try:
+        audit.log(
+            "OWNER_ASSIGNMENTS_IMPORT_COMMIT",
+            actor.id,
+            meta={
+                "applied": result.applied,
+                "unchanged": result.unchanged,
+                "errors": result.errors,
+            },
+        )
+    except Exception:
+        pass
+    try:
+        state_store.delete(_course_imp_key(uid, "assign"))
+    except Exception:
+        pass
+    try:
+        state_store.delete(_course_imp_ck(uid, "assign"))
+    except Exception:
+        pass
+
+    banner = await _maybe_banner(uid)
+    lines = [
+        "✅ Импорт назначений завершён",
+        "",
+        f"▫️ Применено: {result.applied}",
+        f"▫️ Без изменений: {result.unchanged}",
+        f"▫️ Ошибки: {result.errors}",
+        f"▫️ Пропущено: {result.skipped}",
+    ]
+    await cq.message.answer(banner + "\n".join(lines))
+
+    log_csv = preview.log_csv()
+    await cq.message.answer_document(
+        types.BufferedInputFile(log_csv, filename="assignments_import_log.csv"),
+        caption="Лог импорта",
+    )
+    await cq.answer("Импорт применён")
+
+
+@router.callback_query(_is("own", {"course_grades_import"}))
+async def ownui_course_grades_import(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    banner = await _maybe_banner(uid)
+    state_store.put_at(
+        _course_imp_key(uid, "grades"),
+        "course_grades",
+        {"mode": "await_csv"},
+        ttl_sec=900,
+    )
+    lines = [
+        "📝 Загрузка оценок",
+        "",
+        "1️⃣ Скачайте шаблон и заполните столбцы",
+        "   student_email, week, grade, teacher_email",
+        "2️⃣ Убедитесь, что преподаватель совпадает с матрицей",
+        "3️⃣ Отправьте CSV и подтвердите применение",
+        "",
+        "Допустимые значения: целые числа от 1 до 10.",
+    ]
+    kb = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                types.InlineKeyboardButton(
+                    text="⬇️ Скачать шаблон",
+                    callback_data=cb("course_grades_tpl"),
+                )
+            ],
+            _nav_keyboard("course").inline_keyboard[0],
+        ]
+    )
+    try:
+        await cq.message.edit_text(banner + "\n".join(lines), reply_markup=kb)
+    except Exception:
+        await cq.message.answer(banner + "\n".join(lines), reply_markup=kb)
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"course_grades_tpl"}))
+async def ownui_course_grades_tpl(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    data = grades_template()
+    await cq.message.answer_document(
+        types.BufferedInputFile(data, filename="grades.csv"),
+        caption="Шаблон CSV",
+    )
+    await cq.answer()
+
+
+@router.message(F.document, lambda m: _awaits_course_import(m, "grades"))
+async def ownui_course_grades_receive(m: types.Message, actor: Identity):
+    if actor.role != "owner":
+        return
+    uid = _uid(m)
+    try:
+        action, st = state_store.get(_course_imp_key(uid, "grades"))
+    except Exception:
+        return
+    if action != "course_grades":
+        return
+
+    doc = m.document
+    file = await m.bot.get_file(doc.file_id)
+    blob = await m.bot.download_file(file.file_path)
+    content = blob.read()
+
+    ck = hashlib.sha256(content).hexdigest()
+    try:
+        prev_action, prev_ck = state_store.get(_course_imp_ck(uid, "grades"))
+    except Exception:
+        prev_action, prev_ck = None, None
+    if prev_action == "ck" and prev_ck == ck:
+        await m.answer("⚠️ Тот же файл уже обработан — пропущено")
+        return
+    state_store.put_at(_course_imp_ck(uid, "grades"), "ck", ck, ttl_sec=1800)
+
+    preview = preview_grades(content)
+    summary = preview.summary()
+    errors = [row for row in preview.rows if row.status == "error"]
+    apply_candidates = summary.get("new", 0) + summary.get("update", 0)
+    req_id = str(uuid.uuid4())
+    state_store.put_at(
+        _course_imp_key(uid, "grades"),
+        "course_grades",
+        {
+            "mode": "preview",
+            "preview": preview.to_dict(),
+            "req": req_id,
+            "filename": doc.file_name,
+        },
+        ttl_sec=900,
+    )
+    try:
+        audit.log(
+            "OWNER_GRADES_IMPORT_PREVIEW",
+            actor.id,
+            request_id=req_id,
+            meta={
+                "rows_total": summary.get("total", 0),
+                "rows_apply": apply_candidates,
+                "rows_errors": summary.get("error", 0),
+            },
+        )
+    except Exception:
+        pass
+
+    banner = await _maybe_banner(uid)
+    lines = _course_import_summary_lines("📋 Предпросмотр импорта оценок", summary)
+    if doc.file_name:
+        lines.insert(1, f"Файл: {doc.file_name}")
+    if errors:
+        lines.append("\nПримеры ошибок:")
+        for row in errors[:5]:
+            lines.append(f"❌ Строка {row.index}: {row.message}")
+        if len(errors) > 5:
+            lines.append("…")
+
+    kb_rows: list[list[types.InlineKeyboardButton]] = []
+    if apply_candidates:
+        kb_rows.append(
+            [
+                types.InlineKeyboardButton(
+                    text="✅ Применить", callback_data=cb("course_grades_apply")
+                )
+            ]
+        )
+    kb_rows.append(
+        [
+            types.InlineKeyboardButton(
+                text="↻ Загрузить другой файл",
+                callback_data=cb("course_grades_import"),
+            )
+        ]
+    )
+    kb_rows.append(_nav_keyboard("course").inline_keyboard[0])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await m.answer(banner + "\n".join(lines), reply_markup=kb)
+
+    if errors:
+        err_csv = preview.errors_csv()
+        if err_csv:
+            await m.answer_document(
+                types.BufferedInputFile(err_csv, filename="grades_errors.csv"),
+                caption="Ошибки импорта",
+            )
+
+
+@router.callback_query(_is("own", {"course_grades_apply"}))
+async def ownui_course_grades_apply(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    uid = _uid(cq)
+    if _get_impersonation(uid):
+        return await cq.answer(
+            "⛔ Действие недоступно в режиме имперсонизации", show_alert=True
+        )
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    try:
+        action, st = state_store.get(_course_imp_key(uid, "grades"))
+    except Exception:
+        return await cq.answer("Сессия истекла", show_alert=True)
+    if action != "course_grades" or (st or {}).get("mode") != "preview":
+        return await cq.answer("Нет готового предпросмотра", show_alert=True)
+    preview_data = (st or {}).get("preview")
+    if not preview_data:
+        return await cq.answer("Сессия истекла", show_alert=True)
+    preview = GradePreview.from_dict(preview_data)
+    result = apply_grades(preview)
+    try:
+        audit.log(
+            "OWNER_GRADES_IMPORT_COMMIT",
+            actor.id,
+            meta={
+                "applied": result.applied,
+                "unchanged": result.unchanged,
+                "errors": result.errors,
+            },
+        )
+    except Exception:
+        pass
+    try:
+        state_store.delete(_course_imp_key(uid, "grades"))
+    except Exception:
+        pass
+    try:
+        state_store.delete(_course_imp_ck(uid, "grades"))
+    except Exception:
+        pass
+
+    banner = await _maybe_banner(uid)
+    lines = [
+        "✅ Импорт оценок завершён",
+        "",
+        f"▫️ Применено: {result.applied}",
+        f"▫️ Без изменений: {result.unchanged}",
+        f"▫️ Ошибки: {result.errors}",
+        f"▫️ Пропущено: {result.skipped}",
+    ]
+    await cq.message.answer(banner + "\n".join(lines))
+
+    log_csv = preview.log_csv()
+    await cq.message.answer_document(
+        types.BufferedInputFile(log_csv, filename="grades_import_log.csv"),
+        caption="Лог импорта",
+    )
+    await cq.answer("Импорт применён")
 
 
 @router.callback_query(_is("own", {"course_tz_reg_page"}))
@@ -2038,6 +2577,15 @@ def _awaits_imp(m: types.Message, kind: str) -> bool:
     except Exception:
         return False
     return action == kind and (st or {}).get("mode") == "await_csv"
+
+
+def _awaits_course_import(m: types.Message, kind: str) -> bool:
+    try:
+        action, st = state_store.get(_course_imp_key(m.from_user.id, kind))
+    except Exception:
+        return False
+    mode = (st or {}).get("mode")
+    return action == f"course_{kind}" and mode in {"await_csv", "preview"}
 
 
 @router.callback_query(_is("own", {"people_imp_students"}))
@@ -3221,19 +3769,632 @@ async def ownui_reports(cq: types.CallbackQuery, actor: Identity):
     _stack_push(_uid(cq), "reports", {})
 
 
-@router.callback_query(_is("own", {"rep_audit", "rep_grades", "rep_course"}))
-async def ownui_reports_stubs(cq: types.CallbackQuery, actor: Identity):
+@router.callback_query(_is("own", {"rep_audit"}))
+async def ownui_reports_audit(cq: types.CallbackQuery, actor: Identity):
     if actor.role != "owner":
         return await cq.answer("Нет прав", show_alert=True)
-    # гасим токен
     try:
         callbacks.extract(cq.data, expected_role=actor.role)
     except Exception:
         pass
-    # Политика бэкапов: требуем свежий бэкап для тяжёлых операций экспорта
     if not backup_recent():
         return await cq.answer("⛔ Недоступно: нет свежего бэкапа", show_alert=True)
-    await cq.answer("⛔ Функция не реализована", show_alert=True)
+    user_rows: list = []
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                (
+                    "SELECT a.id, a.ts_utc, a.request_id, a.actor_id, a.as_user_id, "
+                    "a.as_role, a.event, a.object_type, a.object_id, a.meta_json, "
+                    "COALESCE(actor.name, '') AS actor_name, "
+                    "COALESCE(actor.role, '') AS actor_role, "
+                    "COALESCE(actor.tg_id, '') AS actor_tg, "
+                    "COALESCE(imp.name, '') AS imp_name, "
+                    "COALESCE(imp.role, '') AS imp_role, "
+                    "COALESCE(imp.tg_id, '') AS imp_tg "
+                    "FROM audit_log a "
+                    "LEFT JOIN users actor ON actor.id = a.actor_id "
+                    "LEFT JOIN users imp ON imp.id = a.as_user_id "
+                    "ORDER BY a.ts_utc DESC, a.id DESC"
+                )
+            ).fetchall()
+            user_rows = conn.execute(
+                (
+                    "SELECT id, COALESCE(name, '') AS name, COALESCE(role, '') AS role, "
+                    "COALESCE(tg_id, '') AS tg_id FROM users"
+                )
+            ).fetchall()
+    except Exception:
+        return await cq.answer("⛔ Не удалось прочитать журнал аудита", show_alert=True)
+    if not rows:
+        return await cq.answer("⛔ Журнал аудита пуст", show_alert=True)
+
+    import csv
+    import io
+    import json
+    import time as _time
+    from datetime import datetime, timezone
+
+    ROLE_LABELS = {
+        "owner": "Владелец",
+        "teacher": "Преподаватель",
+        "student": "Студент",
+        "system": "Система",
+    }
+    MATERIAL_TYPE_LABELS = {
+        "p": "Домашние материалы",
+        "m": "Методические материалы",
+        "n": "Конспект",
+        "s": "Презентация",
+        "v": "Запись лекции",
+    }
+    META_LABELS = {
+        "week": "Неделя",
+        "week_no": "Неделя",
+        "type": "Тип",
+        "version": "Версия",
+        "size_bytes": "Размер",
+        "rows": "Количество строк",
+        "error": "Ошибка",
+        "student_id": "Студент",
+        "teacher_id": "Преподаватель",
+        "target_tg_id": "Целевой TG",
+        "request_id": "Request",
+        "score": "Оценка",
+        "week_code": "Неделя",
+        "week_id": "Неделя",
+    }
+    TOKEN_TRANSLATIONS = {
+        "OWNER": "Владелец",
+        "TEACHER": "Преподаватель",
+        "STUDENT": "Студент",
+        "UPLOAD": "загрузка",
+        "DOWNLOAD": "скачивание",
+        "DELETE": "удаление",
+        "ARCHIVE": "архивация",
+        "MATERIAL": "материал",
+        "ASSIGN": "назначение",
+        "PREVIEW": "предпросмотр",
+        "COMMIT": "фиксация",
+        "GRADE": "оценка",
+        "SET": "установка",
+        "BOOKING": "бронирование",
+        "CREATE": "создание",
+        "CANCEL": "отмена",
+        "AUTO": "авто",
+        "REPORT": "отчёт",
+        "EXPORT": "экспорт",
+        "AUDIT": "аудит",
+        "IMPERSONATE": "имперсонизация",
+        "START": "старт",
+        "STOP": "завершение",
+        "EXIT": "выход",
+        "SYSTEM": "Система",
+        "BACKUP": "бэкап",
+        "DAILY": "ежедневный",
+        "COMMITED": "зафиксирован",
+        "COURSE": "курс",
+        "UPDATE": "обновление",
+        "OVERRIDE": "изменение",
+    }
+
+    def _role_label(role: str | None) -> str:
+        if not role:
+            return ""
+        return ROLE_LABELS.get(role, role)
+
+    def _format_user(name: str | None, role: str | None, tg: str | None) -> str:
+        role_part = _role_label(role)
+        display_name = (name or "").strip()
+        tg_part = (tg or "").strip()
+        if not display_name:
+            display_name = f"tg:{tg_part}" if tg_part else "неизвестный пользователь"
+        if tg_part and display_name != f"tg:{tg_part}":
+            display_name = f"{display_name} (tg:{tg_part})"
+        return f"{role_part} {display_name}".strip()
+
+    def _event_label(event: str | None) -> str:
+        if not event:
+            return "событие неизвестно"
+        tokens = [t for t in event.split("_") if t]
+        translated = [TOKEN_TRANSLATIONS.get(tok, tok.lower()) for tok in tokens]
+        label = " ".join(translated).strip()
+        if not label:
+            return event
+        return label[0].upper() + label[1:]
+
+    user_map: dict[str, dict[str, str]] = {}
+    for u in user_rows:
+        try:
+            uid = str(u["id"])
+        except Exception:
+            uid = str(u[0]) if u and u[0] else ""
+        if not uid:
+            continue
+        if hasattr(u, "keys"):
+            name_val = str(u["name"] or "")
+            role_val = str(u["role"] or "")
+            tg_val = str(u["tg_id"] or "")
+        else:
+            name_val = str(u[1] or "") if len(u) > 1 else ""
+            role_val = str(u[2] or "") if len(u) > 2 else ""
+            tg_val = str(u[3] or "") if len(u) > 3 else ""
+        user_map[uid] = {"name": name_val, "role": role_val, "tg": tg_val}
+
+    def _value_to_human(key: str, value: object) -> str:
+        if value is None:
+            return "—"
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        if isinstance(value, (int, float)):
+            if key == "size_bytes":
+                try:
+                    return _fmt_bytes(int(value))
+                except Exception:
+                    return str(value)
+            return str(value)
+        sval = str(value)
+        if key.endswith("_id") and sval in user_map:
+            u = user_map[sval]
+            return _format_user(u.get("name"), u.get("role"), u.get("tg"))
+        if key in {"student", "teacher", "user"} and sval in user_map:
+            u = user_map[sval]
+            return _format_user(u.get("name"), u.get("role"), u.get("tg"))
+        if key in {"week", "week_no", "week_code", "week_id"}:
+            try:
+                num = int(sval)
+                return f"W{num:02d}"
+            except Exception:
+                return sval
+        if key == "type":
+            return MATERIAL_TYPE_LABELS.get(sval, sval)
+        if key == "visibility":
+            return "Только преподавателям" if sval == "teacher_only" else "Для всех"
+        return sval
+
+    def _meta_for_csv(meta: object) -> str:
+        if not meta:
+            return ""
+        if isinstance(meta, dict):
+            parts: list[str] = []
+            for key, value in meta.items():
+                try:
+                    parts.append(f"{key}={_value_to_human(key, value)}")
+                except Exception:
+                    parts.append(f"{key}={value}")
+            return "; ".join(parts)
+        if isinstance(meta, list):
+            return json.dumps(meta, ensure_ascii=False, sort_keys=True)
+        return str(meta)
+
+    def _meta_for_human(meta: object) -> str:
+        if not meta:
+            return ""
+        if isinstance(meta, dict):
+            parts: list[str] = []
+            for key, value in meta.items():
+                label = META_LABELS.get(key, key)
+                try:
+                    val = _value_to_human(key, value)
+                except Exception:
+                    val = value
+                parts.append(f"{label}: {val}")
+            return "; ".join(parts)
+        if isinstance(meta, list):
+            return json.dumps(meta, ensure_ascii=False, sort_keys=True)
+        return str(meta)
+
+    def _fmt(value: object) -> str:
+        return "" if value is None else str(value)
+
+    entries: list[tuple] = []
+    for row in rows:
+        raw_meta = row["meta_json"]
+        parsed_meta: object
+        if raw_meta:
+            try:
+                parsed_meta = json.loads(raw_meta)
+            except Exception:
+                parsed_meta = raw_meta
+        else:
+            parsed_meta = {}
+        entries.append((row, parsed_meta))
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(
+        [
+            "entry_id",
+            "ts_iso",
+            "event",
+            "actor_id",
+            "actor_name",
+            "actor_role",
+            "actor_tg",
+            "as_user_id",
+            "as_name",
+            "as_role",
+            "as_tg",
+            "object_type",
+            "object_id",
+            "request_id",
+            "meta",
+        ]
+    )
+
+    pretty_lines: list[str] = []
+
+    for row, meta in entries:
+        dt = datetime.fromtimestamp(int(row["ts_utc"] or 0), timezone.utc)
+        ts_iso = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+        as_role = row["as_role"] or row["imp_role"]
+        meta_csv = _meta_for_csv(meta)
+        writer.writerow(
+            [
+                _fmt(row["id"]),
+                ts_iso,
+                _fmt(row["event"]),
+                _fmt(row["actor_id"]),
+                _fmt(row["actor_name"]),
+                _fmt(row["actor_role"]),
+                _fmt(row["actor_tg"]),
+                _fmt(row["as_user_id"]),
+                _fmt(row["imp_name"]),
+                _fmt(as_role),
+                _fmt(row["imp_tg"]),
+                _fmt(row["object_type"]),
+                _fmt(row["object_id"]),
+                _fmt(row["request_id"]),
+                meta_csv,
+            ]
+        )
+
+        actor_display = _format_user(
+            row["actor_name"], row["actor_role"], row["actor_tg"]
+        )
+        impersonated_display = ""
+        imp_role = row["imp_role"] or row["as_role"]
+        if row["imp_name"] or imp_role or row["imp_tg"]:
+            impersonated_display = _format_user(
+                row["imp_name"],
+                imp_role,
+                row["imp_tg"],
+            )
+        meta_human = _meta_for_human(meta)
+        line_parts = [dt.strftime("%Y-%m-%d %H:%M:%S"), "—", actor_display]
+        if impersonated_display:
+            line_parts.extend(["(как", f"{impersonated_display})"])
+        line_parts.extend([":", _event_label(row["event"])])
+        if meta_human:
+            line_parts.extend(["—", meta_human])
+        pretty_lines.append(" ".join([p for p in line_parts if p]))
+
+    csv_bytes = buf.getvalue().encode("utf-8")
+    pretty_bytes = "\n".join(pretty_lines).encode("utf-8")
+    ts = _time.strftime("%Y%m%d_%H%M%S", _time.gmtime())
+    filename_csv = f"audit_log_{ts}.csv"
+    filename_txt = f"audit_log_{ts}_human.txt"
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+
+    try:
+        buffered_cls = getattr(types, "BufferedInputFile", None)
+        if buffered_cls:
+            caption_lines_txt: list[str] = []
+            if banner:
+                caption_lines_txt.append(banner.strip())
+            caption_lines_txt.append(
+                f"AuditLog — {len(pretty_lines)} записей (человекочитаемый журнал)"
+            )
+            txt_caption = "\n".join(filter(None, caption_lines_txt)) or None
+            await cq.message.answer_document(
+                buffered_cls(pretty_bytes, filename=filename_txt),
+                caption=txt_caption,
+            )
+
+            caption_lines_csv = [f"AuditLog — {len(pretty_lines)} записей (CSV)"]
+            csv_caption = "\n".join(caption_lines_csv)
+            await cq.message.answer_document(
+                buffered_cls(csv_bytes, filename=filename_csv),
+                caption=csv_caption,
+            )
+        else:
+            limit = min(15, len(pretty_lines))
+            header = f"📓 AuditLog (первые {limit} из {len(pretty_lines)} записей):"
+            body = "\n".join(pretty_lines[:limit])
+            text = (banner or "") + header + "\n" + body
+            await cq.message.answer(text)
+    except Exception:
+        return await cq.answer(
+            "⛔ Не удалось сформировать/отправить экспорт", show_alert=True
+        )
+
+    try:
+        audit.log(
+            "OWNER_AUDIT_EXPORT",
+            actor.id,
+            meta={
+                "report_type": "audit_log",
+                "formats": ["csv", "human_txt"],
+                "records_count": len(pretty_lines),
+            },
+            **_audit_kwargs(uid),
+        )
+    except Exception:
+        pass
+
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"rep_grades"}))
+async def ownui_reports_grades(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    if not backup_recent():
+        return await cq.answer("⛔ Недоступно: нет свежего бэкапа", show_alert=True)
+
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                (
+                    "SELECT g.student_id, g.week_no, g.score_int, g.graded_at_utc, g.id AS grade_id, "
+                    "COALESCE(st.name, '') AS student_name, "
+                    "COALESCE(st.group_name, '') AS group_name, "
+                    "COALESCE(st.email, '') AS student_email, "
+                    "COALESCE(st.tg_id, '') AS student_tg "
+                    "FROM grades g "
+                    "JOIN users st ON st.id = g.student_id "
+                    "WHERE st.role='student' "
+                    "  AND g.id = ("
+                    "        SELECT g2.id FROM grades g2 "
+                    "        WHERE g2.student_id = g.student_id AND g2.week_no = g.week_no "
+                    "        ORDER BY g2.graded_at_utc DESC, g2.id DESC LIMIT 1"
+                    "      ) "
+                    "ORDER BY st.group_name ASC, st.name ASC, g.student_id ASC, "
+                    "         g.week_no ASC"
+                )
+            ).fetchall()
+    except Exception:
+        return await cq.answer("⛔ Не удалось прочитать оценки", show_alert=True)
+
+    records: list[dict[str, str]] = []
+    for row in rows:
+        student_id = str(row["student_id"])
+        try:
+            week_no = int(row["week_no"])
+        except (TypeError, ValueError):
+            continue
+        grade_val = str(row["score_int"] or "").strip()
+        if not grade_val:
+            continue
+        name = str(row["student_name"] or "").strip()
+        if not name:
+            name = f"ID {student_id}"
+        group_name = str(row["group_name"] or "").strip()
+        email = str(row["student_email"] or "").strip()
+        records.append(
+            {
+                "student": name,
+                "group": group_name,
+                "email": email,
+                "week": f"W{week_no:02d}",
+                "grade": grade_val,
+            }
+        )
+
+    if not records:
+        return await cq.answer("⛔ Нет выставленных оценок", show_alert=True)
+
+    import csv
+    import io
+    import time as _time
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["student", "group", "email", "week", "grade"])
+    for rec in records:
+        writer.writerow(
+            [rec["student"], rec["group"], rec["email"], rec["week"], rec["grade"]]
+        )
+
+    csv_bytes = buf.getvalue().encode("utf-8")
+    ts = _time.strftime("%Y%m%d_%H%M%S", _time.gmtime())
+    filename = f"grades_{ts}.csv"
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+
+    try:
+        buffered_cls = getattr(types, "BufferedInputFile", None)
+        if buffered_cls:
+            caption_lines: list[str] = []
+            if banner:
+                caption_lines.append(banner.strip())
+            caption_lines.append(f"Экспорт оценок — {len(records)} записей (CSV)")
+            caption = "\n".join(filter(None, caption_lines)) or None
+            await cq.message.answer_document(
+                buffered_cls(csv_bytes, filename=filename),
+                caption=caption,
+            )
+        else:
+            preview = []
+            limit = min(15, len(records))
+            for rec in records[:limit]:
+                base = f"{rec['student']} — {rec['week']} — {rec['grade']}"
+                extras: list[str] = []
+                if rec["group"]:
+                    extras.append(rec["group"])
+                if rec["email"]:
+                    extras.append(rec["email"])
+                if extras:
+                    base += f" ({', '.join(extras)})"
+                preview.append(base)
+            header = f"📄 Оценки (первые {limit} из {len(records)} записей):"
+            body = "\n".join(preview)
+            text = (banner or "") + header + "\n" + body
+            await cq.message.answer(text)
+    except Exception:
+        return await cq.answer(
+            "⛔ Не удалось сформировать/отправить экспорт", show_alert=True
+        )
+
+    try:
+        audit.log(
+            "OWNER_REPORT_EXPORT",
+            actor.id,
+            meta={"type": "grades_csv", "records_count": len(records)},
+            **_audit_kwargs(uid),
+        )
+    except Exception:
+        pass
+
+    await cq.answer()
+
+
+@router.callback_query(_is("own", {"rep_course"}))
+async def ownui_reports_course(cq: types.CallbackQuery, actor: Identity):
+    if actor.role != "owner":
+        return await cq.answer("Нет прав", show_alert=True)
+    try:
+        callbacks.extract(cq.data, expected_role=actor.role)
+    except Exception:
+        pass
+    if not backup_recent():
+        return await cq.answer("⛔ Недоступно: нет свежего бэкапа", show_alert=True)
+
+    try:
+        with db() as conn:
+            course_row = conn.execute(
+                "SELECT name, tz FROM course WHERE id=1"
+            ).fetchone()
+            weeks = conn.execute(
+                (
+                    "SELECT week_no, COALESCE(topic, title) AS topic, "
+                    "       COALESCE(description, '') AS description, "
+                    "       deadline_ts_utc "
+                    "FROM weeks ORDER BY week_no ASC"
+                )
+            ).fetchall()
+    except Exception:
+        return await cq.answer(
+            "⛔ Не удалось подготовить экспорт курса", show_alert=True
+        )
+
+    if not weeks:
+        return await cq.answer("⛔ Нет данных о неделях курса", show_alert=True)
+
+    course_name = ""
+    course_tz = None
+    if course_row:
+        try:
+            course_name = str(course_row[0] or "").strip()
+        except Exception:
+            course_name = ""
+        try:
+            course_tz = str(course_row[1] or "").strip() or None
+        except Exception:
+            course_tz = None
+
+    import csv
+    import io
+    import time as _time
+    from datetime import datetime, timezone
+
+    try:
+        from app.services.common.time_service import format_datetime, get_course_tz
+    except Exception:
+
+        def format_datetime(ts: int, _tz: str | None = None) -> str:
+            return datetime.fromtimestamp(int(ts), timezone.utc).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+
+        def get_course_tz() -> str:
+            return "UTC"
+
+    tzname = course_tz or get_course_tz()
+
+    def _fmt_deadline(ts: int | None) -> str:
+        if ts is None:
+            return ""
+        try:
+            local = format_datetime(int(ts), tzname)
+            if local.endswith(" 23:59"):
+                return local[:10]
+            return local
+        except Exception:
+            return datetime.fromtimestamp(int(ts), timezone.utc).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["week_id", "topic", "description", "deadline"])
+    for row in weeks:
+        week_no = int(row["week_no"])
+        topic = str(row["topic"] or "").strip()
+        description = str(row["description"] or "").strip()
+        deadline = _fmt_deadline(row["deadline_ts_utc"])
+        writer.writerow([f"W{week_no:02d}", topic, description, deadline])
+
+    csv_bytes = buf.getvalue().encode("utf-8")
+    ts = _time.strftime("%Y%m%d_%H%M%S", _time.gmtime())
+    filename = f"course_{ts}.csv"
+    uid = _uid(cq)
+    banner = await _maybe_banner(uid)
+
+    try:
+        buffered_cls = getattr(types, "BufferedInputFile", None)
+        if buffered_cls:
+            caption_lines: list[str] = []
+            if banner:
+                caption_lines.append(banner.strip())
+            title = course_name or "(без названия)"
+            caption_lines.append(f"Экспорт курса — {title} (недель: {len(weeks)})")
+            if tzname:
+                caption_lines.append(f"TZ: {tzname}")
+            caption = "\n".join(filter(None, caption_lines)) or None
+            await cq.message.answer_document(
+                buffered_cls(csv_bytes, filename=filename),
+                caption=caption,
+            )
+        else:
+            preview = []
+            limit = min(10, len(weeks))
+            for row in weeks[:limit]:
+                week_no = int(row["week_no"])
+                topic = str(row["topic"] or "").strip() or "(без темы)"
+                deadline = _fmt_deadline(row["deadline_ts_utc"])
+                base = f"W{week_no:02d} — {topic}"
+                if deadline:
+                    base += f" — дедлайн {deadline}"
+                preview.append(base)
+            header = (
+                f"📘 Курс {course_name or '(без названия)'} "
+                f"(первые {limit} из {len(weeks)} недель)"
+            )
+            body = "\n".join(preview)
+            text = (banner or "") + header + "\n" + body
+            await cq.message.answer(text)
+    except Exception:
+        return await cq.answer(
+            "⛔ Не удалось сформировать/отправить экспорт", show_alert=True
+        )
+
+    try:
+        audit.log(
+            "OWNER_REPORT_EXPORT",
+            actor.id,
+            meta={"type": "course_csv", "records_count": len(weeks)},
+            **_audit_kwargs(uid),
+        )
+    except Exception:
+        pass
+
+    await cq.answer()
 
 
 @router.callback_query(_is("own", {"rep_backup"}))
